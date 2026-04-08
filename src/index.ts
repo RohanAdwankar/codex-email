@@ -45,6 +45,10 @@ const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
 const DEFAULT_POLL_MS = 30_000;
+const GMAIL_QUICKSTART_URL = "https://developers.google.com/workspace/gmail/api/quickstart/nodejs";
+const GMAIL_API_ENABLE_URL = "https://console.cloud.google.com/apis/library/gmail.googleapis.com";
+const GOOGLE_AUTH_BRANDING_URL = "https://console.cloud.google.com/auth/branding";
+const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -420,6 +424,34 @@ function sleep(ms: number): Promise<void> {
 }
 
 void main().catch((error) => {
+  if (isMissingOauthClientFile(error)) {
+    console.error("Missing Gmail OAuth client file.");
+    console.error("");
+    console.error(`Expected file: ${DEFAULT_CLIENT_PATH}`);
+    console.error("");
+    console.error("Create a Google Cloud desktop OAuth client for Gmail:");
+    console.error(`- Gmail API quickstart: ${GMAIL_QUICKSTART_URL}`);
+    console.error(`- Enable Gmail API: ${GMAIL_API_ENABLE_URL}`);
+    console.error(`- OAuth consent screen: ${GOOGLE_AUTH_BRANDING_URL}`);
+    console.error(`- OAuth clients: ${GOOGLE_AUTH_CLIENTS_URL}`);
+    console.error("");
+    console.error("After downloading the OAuth client JSON, place it here:");
+    console.error(`mkdir -p ${APP_DIR}`);
+    console.error(`mv ~/Downloads/<client>.json ${DEFAULT_CLIENT_PATH}`);
+    process.exitCode = 1;
+    return;
+  }
   console.error(error);
   process.exitCode = 1;
 });
+
+function isMissingOauthClientFile(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as NodeJS.ErrnoException).code === "ENOENT" &&
+    "path" in error &&
+    (error as NodeJS.ErrnoException).path === DEFAULT_CLIENT_PATH
+  );
+}

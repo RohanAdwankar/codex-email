@@ -7,6 +7,10 @@ Turns a Gmail inbox into Codex threads on your own machine.
 1. Install dependencies:
    `pnpm install`
 2. Create a Google Cloud OAuth desktop client with the Gmail API enabled.
+   Gmail API quickstart: `https://developers.google.com/workspace/gmail/api/quickstart/nodejs`
+   Enable Gmail API: `https://console.cloud.google.com/apis/library/gmail.googleapis.com`
+   OAuth consent screen: `https://console.cloud.google.com/auth/branding`
+   OAuth clients: `https://console.cloud.google.com/auth/clients`
 3. Save the client JSON to:
    `~/.config/codex-gmail-bridge/google-oauth-client.json`
 4. Bootstrap Gmail auth:
