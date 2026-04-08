@@ -10,7 +10,9 @@ Turns a Gmail inbox into Codex threads on your own machine.
    `pnpm auth`
    The command walks you through the Google OAuth setup.
    If Google says the app is still in testing, add your Gmail as a test user in Google Auth Platform > Audience.
-3. Run the worker:
+3. Enable the Gmail API for your Google Cloud project:
+   `https://console.developers.google.com/apis/api/gmail.googleapis.com/overview`
+4. Run the worker:
    `pnpm daemon`
 
 ## Behavior

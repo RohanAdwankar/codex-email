@@ -520,6 +520,34 @@ function maybeOpenBrowser(url: string): void {
 }
 
 void main().catch((error) => {
+  if (isGmailApiNotEnabledError(error)) {
+    const enableUrl = extractExtendedHelpUrl(error) ?? "https://console.developers.google.com/apis/api/gmail.googleapis.com/overview";
+    console.error("Gmail API is not enabled for this Google Cloud project.");
+    console.error(`Open: ${enableUrl}`);
+    console.error("Enable the Gmail API, wait a minute, then run `pnpm daemon` again.");
+    process.exitCode = 1;
+    return;
+  }
   console.error(error);
   process.exitCode = 1;
 });
+
+function isGmailApiNotEnabledError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("errors" in error)) {
+    return false;
+  }
+  const errors = (error as { errors?: Array<{ reason?: string }> }).errors;
+  return Array.isArray(errors) && errors.some((entry) => entry.reason === "accessNotConfigured");
+}
+
+function extractExtendedHelpUrl(error: unknown): string | null {
+  if (typeof error !== "object" || error === null || !("errors" in error)) {
+    return null;
+  }
+  const errors = (error as { errors?: Array<{ extendedHelp?: string }> }).errors;
+  if (!Array.isArray(errors)) {
+    return null;
+  }
+  const url = errors.map((entry) => entry.extendedHelp).find((value) => typeof value === "string");
+  return url ?? null;
+}
