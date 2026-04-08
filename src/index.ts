@@ -1,52 +1,58 @@
 import fs from "node:fs/promises";
-import http from "node:http";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
 import readline from "node:readline/promises";
+import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-import { google, gmail_v1 } from "googleapis";
-import { OAuth2Client } from "google-auth-library";
 import { Codex } from "@openai/codex-sdk";
+import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
+import nodemailer from "nodemailer";
 
-type GmailThreadState = {
-  codexThreadId: string;
-  lastProcessedMessageId: string;
-  subject?: string;
-  updatedAt: string;
+type BridgeConfig = {
+  emailAddress: string;
+  appPassword: string;
+  imapHost: string;
+  imapPort: number;
+  smtpHost: string;
+  smtpPort: number;
+  secureImap: boolean;
+  secureSmtp: boolean;
 };
 
 type BridgeState = {
-  gmailThreads: Record<string, GmailThreadState>;
+  messageToThread: Record<string, string>;
+  processedUids: Record<string, true>;
+  updatedAt?: string;
 };
 
-type OAuthClientConfig = {
-  installed?: {
-    client_id: string;
-    client_secret: string;
-    redirect_uris: string[];
-  };
-  web?: {
-    client_id: string;
-    client_secret: string;
-    redirect_uris: string[];
-  };
+type Context = {
+  config: BridgeConfig;
+  statePath: string;
+  pollMs: number;
+  codex: Codex;
+  workdir: string;
+  model?: string;
 };
 
-const SCOPES = [
-  "https://www.googleapis.com/auth/gmail.modify",
-  "https://www.googleapis.com/auth/gmail.send",
-];
+type ParsedMail = {
+  uid: number;
+  subject: string;
+  from: string;
+  body: string;
+  messageId: string;
+  references: string[];
+  inReplyTo?: string | undefined;
+};
 
 const APP_DIR = path.join(os.homedir(), ".config", "codex-gmail-bridge");
-const DEFAULT_CLIENT_PATH = path.join(APP_DIR, "google-oauth-client.json");
-const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
+const DEFAULT_CONFIG_PATH = path.join(APP_DIR, "config.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
 const DEFAULT_POLL_MS = 30_000;
-const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
+const APP_PASSWORDS_URL = "https://myaccount.google.com/apppasswords";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -55,7 +61,7 @@ async function main(): Promise<void> {
   }
 
   if (command === "auth") {
-    await authorizeInteractive();
+    await configureInteractive();
     return;
   }
 
@@ -71,32 +77,57 @@ async function main(): Promise<void> {
   }
 }
 
-type Context = {
-  gmail: gmail_v1.Gmail;
-  statePath: string;
-  pollMs: number;
-  emailAddress: string;
-  codex: Codex;
-  workdir: string;
-  model?: string;
-};
+async function configureInteractive(): Promise<void> {
+  await fs.mkdir(APP_DIR, { recursive: true });
+  const rl = readline.createInterface({ input, output });
+
+  console.log("");
+  console.log("Gmail app password setup is required once.");
+  console.log(`Open: ${APP_PASSWORDS_URL}`);
+  console.log("Create an app password for Mail, then paste it here.");
+  console.log("");
+  maybeOpenBrowser(APP_PASSWORDS_URL);
+
+  const emailAddress =
+    (await rl.question(`Gmail address [${DEFAULT_EMAIL_ADDRESS}]: `)).trim() || DEFAULT_EMAIL_ADDRESS;
+  const appPassword = (await rl.question("App password: ")).trim().replace(/\s+/g, "");
+  rl.close();
+
+  if (!appPassword) {
+    throw new Error("No app password was provided.");
+  }
+
+  const config: BridgeConfig = {
+    emailAddress,
+    appPassword,
+    imapHost: "imap.gmail.com",
+    imapPort: 993,
+    smtpHost: "smtp.gmail.com",
+    smtpPort: 465,
+    secureImap: true,
+    secureSmtp: true,
+  };
+
+  await testConnections(config);
+  await fs.writeFile(DEFAULT_CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  console.log(`Saved config to ${DEFAULT_CONFIG_PATH}`);
+}
 
 async function createContext(): Promise<Context> {
-  const auth = await loadAuthorizedClient();
-  const gmail = google.gmail({ version: "v1", auth });
-  const emailAddress = process.env.CODEX_EMAIL_ADDRESS || DEFAULT_EMAIL_ADDRESS;
-  const workdir = process.env.CODEX_EMAIL_WORKDIR || os.homedir();
+  await fs.mkdir(APP_DIR, { recursive: true });
+  const config = JSON.parse(await fs.readFile(DEFAULT_CONFIG_PATH, "utf8")) as BridgeConfig;
   const pollMs = Number(process.env.CODEX_EMAIL_POLL_MS || DEFAULT_POLL_MS);
+  const workdir = process.env.CODEX_EMAIL_WORKDIR || os.homedir();
   const model = process.env.CODEX_EMAIL_MODEL;
   const codex = new Codex();
 
-  await fs.mkdir(APP_DIR, { recursive: true });
-
   return {
-    gmail,
+    config,
     statePath: DEFAULT_STATE_PATH,
     pollMs,
-    emailAddress,
     codex,
     workdir,
     model,
@@ -105,87 +136,107 @@ async function createContext(): Promise<Context> {
 
 async function processUnreadMessages(ctx: Context): Promise<void> {
   const state = await loadState(ctx.statePath);
-  const list = await ctx.gmail.users.messages.list({
-    userId: "me",
-    q: `is:unread in:inbox to:${ctx.emailAddress} -from:me`,
-    maxResults: 25,
+  const imap = new ImapFlow({
+    host: ctx.config.imapHost,
+    port: ctx.config.imapPort,
+    secure: ctx.config.secureImap,
+    auth: {
+      user: ctx.config.emailAddress,
+      pass: ctx.config.appPassword,
+    },
   });
 
-  const messages = list.data.messages ?? [];
-  const detailed = await Promise.all(
-    messages.map((message) =>
-      ctx.gmail.users.messages.get({
-        userId: "me",
-        id: message.id!,
-        format: "full",
-      }),
-    ),
-  );
-
-  detailed.sort((a, b) => {
-    const left = Number(a.data.internalDate || 0);
-    const right = Number(b.data.internalDate || 0);
-    return left - right;
-  });
-
-  for (const response of detailed) {
-    const message = response.data;
-    const messageId = message.id;
-    const gmailThreadId = message.threadId;
-    if (!messageId || !gmailThreadId) {
-      continue;
-    }
-
-    const existing = state.gmailThreads[gmailThreadId];
-    if (existing?.lastProcessedMessageId === messageId) {
-      continue;
-    }
-
-    const parsed = parseIncomingMessage(message);
-    if (!parsed.body.trim()) {
-      await markRead(ctx.gmail, messageId);
-      continue;
-    }
-
-    const thread = existing?.codexThreadId
-      ? ctx.codex.resumeThread(existing.codexThreadId, codexThreadOptions(ctx))
-      : ctx.codex.startThread(codexThreadOptions(ctx));
-
-    const prompt = existing
-      ? parsed.body
-      : `You are replying by email. Keep the response concise and plain text unless formatting is clearly useful.\n\n${parsed.body}`;
-
-    let resultText: string;
+  await imap.connect();
+  try {
+    const lock = await imap.getMailboxLock("INBOX");
     try {
-      const result = await thread.run(prompt);
-      resultText = result.finalResponse.trim() || "(No response text returned.)";
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : String(error);
-      resultText = `Codex run failed:\n\n${messageText}`;
+      const messages: ParsedMail[] = [];
+      for await (const message of imap.fetch({ seen: false }, { uid: true, source: true, envelope: true })) {
+        if (!message.uid || !message.source) {
+          continue;
+        }
+        const uidKey = String(message.uid);
+        if (state.processedUids[uidKey]) {
+          continue;
+        }
+
+        const parsed = await simpleParser(message.source);
+        const from = parsed.from?.value?.[0]?.address?.trim() || "";
+        if (!from || from.toLowerCase() === ctx.config.emailAddress.toLowerCase()) {
+          await imap.messageFlagsAdd(message.uid, ["\\Seen"]);
+          state.processedUids[uidKey] = true;
+          continue;
+        }
+
+        const body = (parsed.text || parsed.html || "").toString().trim();
+        if (!body) {
+          await imap.messageFlagsAdd(message.uid, ["\\Seen"]);
+          state.processedUids[uidKey] = true;
+          continue;
+        }
+
+        const refs = normalizeReferences(parsed.references);
+        const inReplyToRaw = parsed.inReplyTo ? normalizeMessageId(parsed.inReplyTo) : null;
+        const inReplyTo = inReplyToRaw ?? undefined;
+        const messageId = normalizeMessageId(parsed.messageId) || `${uidKey}@local`;
+
+        messages.push({
+          uid: message.uid,
+          subject: parsed.subject || "(no subject)",
+          from,
+          body,
+          messageId,
+          references: refs,
+          inReplyTo,
+        });
+      }
+
+      messages.sort((a, b) => a.uid - b.uid);
+      for (const message of messages) {
+        const codexThreadId = findThreadForMessage(state, message);
+        const thread = codexThreadId
+          ? ctx.codex.resumeThread(codexThreadId, codexThreadOptions(ctx))
+          : ctx.codex.startThread(codexThreadOptions(ctx));
+
+        const prompt = codexThreadId
+          ? message.body
+          : `You are replying by email. Keep the response concise and plain text unless formatting is clearly useful.\n\n${message.body}`;
+
+        let responseText: string;
+        try {
+          const result = await thread.run(prompt);
+          responseText = result.finalResponse.trim() || "(No response text returned.)";
+        } catch (error) {
+          const messageText = error instanceof Error ? error.message : String(error);
+          responseText = `Codex run failed:\n\n${messageText}`;
+        }
+
+        if (!thread.id) {
+          throw new Error(`Codex thread id missing after processing email uid ${message.uid}`);
+        }
+
+        const sentMessageId = await sendReply(ctx.config, {
+          to: message.from,
+          subject: replySubject(message.subject),
+          body: responseText,
+          inReplyTo: message.messageId,
+          references: [...message.references, message.messageId],
+        });
+
+        state.messageToThread[message.messageId] = thread.id;
+        if (sentMessageId) {
+          state.messageToThread[sentMessageId] = thread.id;
+        }
+        state.processedUids[String(message.uid)] = true;
+        state.updatedAt = new Date().toISOString();
+        await saveState(ctx.statePath, state);
+        await imap.messageFlagsAdd(message.uid, ["\\Seen"]);
+      }
+    } finally {
+      lock.release();
     }
-
-    await sendReply(ctx.gmail, {
-      to: parsed.from,
-      from: ctx.emailAddress,
-      subject: replySubject(parsed.subject),
-      body: resultText,
-      threadId: gmailThreadId,
-      inReplyTo: parsed.messageHeaderId,
-      references: parsed.references,
-    });
-
-    if (!thread.id) {
-      throw new Error(`Codex thread id missing after processing Gmail thread ${gmailThreadId}`);
-    }
-
-    state.gmailThreads[gmailThreadId] = {
-      codexThreadId: thread.id,
-      lastProcessedMessageId: messageId,
-      subject: parsed.subject,
-      updatedAt: new Date().toISOString(),
-    };
-    await saveState(ctx.statePath, state);
-    await markRead(ctx.gmail, messageId);
+  } finally {
+    await imap.logout();
   }
 }
 
@@ -199,155 +250,75 @@ function codexThreadOptions(ctx: Context) {
   };
 }
 
-async function authorizeInteractive(): Promise<void> {
-  await fs.mkdir(APP_DIR, { recursive: true });
-  await ensureOauthClientFileInteractive();
-  const { oauthClient, redirectUri } = await buildOAuthClientFromDisk();
-  const url = oauthClient.generateAuthUrl({
-    access_type: "offline",
-    prompt: "consent",
-    scope: SCOPES,
+function findThreadForMessage(state: BridgeState, message: ParsedMail): string | null {
+  const keys = [...message.references];
+  if (message.inReplyTo) {
+    keys.push(message.inReplyTo);
+  }
+  for (const key of keys) {
+    const threadId = state.messageToThread[key];
+    if (threadId) {
+      return threadId;
+    }
+  }
+  return null;
+}
+
+async function testConnections(config: BridgeConfig): Promise<void> {
+  const imap = new ImapFlow({
+    host: config.imapHost,
+    port: config.imapPort,
+    secure: config.secureImap,
+    auth: {
+      user: config.emailAddress,
+      pass: config.appPassword,
+    },
+  });
+  await imap.connect();
+  await imap.logout();
+
+  const transporter = nodemailer.createTransport({
+    host: config.smtpHost,
+    port: config.smtpPort,
+    secure: config.secureSmtp,
+    auth: {
+      user: config.emailAddress,
+      pass: config.appPassword,
+    },
+  });
+  await transporter.verify();
+}
+
+async function sendReply(
+  config: BridgeConfig,
+  args: {
+    to: string;
+    subject: string;
+    body: string;
+    inReplyTo: string;
+    references: string[];
+  },
+): Promise<string | null> {
+  const transporter = nodemailer.createTransport({
+    host: config.smtpHost,
+    port: config.smtpPort,
+    secure: config.secureSmtp,
+    auth: {
+      user: config.emailAddress,
+      pass: config.appPassword,
+    },
   });
 
-  console.log("Open this URL in a browser:");
-  console.log(url);
-
-  const code = shouldAutoListenForOAuthCode(redirectUri)
-    ? await waitForOAuthCode(redirectUri)
-    : await promptForOAuthCode(
-        "After approval, copy the `code` value from the browser URL and paste it here.",
-      );
-
-  const { tokens } = await oauthClient.getToken(code);
-  oauthClient.setCredentials(tokens);
-  await fs.writeFile(DEFAULT_TOKEN_PATH, JSON.stringify(tokens, null, 2) + "\n", "utf8");
-  console.log(`Saved token to ${DEFAULT_TOKEN_PATH}`);
-}
-
-async function loadAuthorizedClient(): Promise<OAuth2Client> {
-  const { oauthClient } = await buildOAuthClientFromDisk();
-  const token = JSON.parse(await fs.readFile(DEFAULT_TOKEN_PATH, "utf8")) as Record<string, unknown>;
-  oauthClient.setCredentials(token);
-  return oauthClient;
-}
-
-async function buildOAuthClientFromDisk(): Promise<{ oauthClient: OAuth2Client; redirectUri: string }> {
-  const raw = JSON.parse(await fs.readFile(DEFAULT_CLIENT_PATH, "utf8")) as OAuthClientConfig;
-  const cfg = raw.installed ?? raw.web;
-  if (!cfg) {
-    throw new Error(`OAuth client JSON at ${DEFAULT_CLIENT_PATH} is missing installed/web credentials`);
-  }
-  const redirectUri = cfg.redirect_uris[0];
-  return {
-    oauthClient: new google.auth.OAuth2(cfg.client_id, cfg.client_secret, redirectUri),
-    redirectUri,
-  };
-}
-
-async function ensureOauthClientFileInteractive(): Promise<void> {
-  try {
-    await fs.access(DEFAULT_CLIENT_PATH);
-    return;
-  } catch {
-    // fall through
-  }
-
-  await fs.mkdir(APP_DIR, { recursive: true });
-  const rl = readline.createInterface({ input, output });
-
-  console.log("");
-  console.log("Google OAuth setup is required once.");
-  console.log(`Open: ${GOOGLE_AUTH_CLIENTS_URL}`);
-  console.log("Create a project if needed, create a Desktop app OAuth client, and download the JSON.");
-  console.log("");
-  maybeOpenBrowser(GOOGLE_AUTH_CLIENTS_URL);
-
-  const response = (
-    await rl.question("Paste the downloaded JSON here, or type a file path to it: ")
-  ).trim();
-
-  if (!response) {
-    rl.close();
-    throw new Error("No OAuth client JSON or file path was provided.");
-  }
-
-  if (response.startsWith("{")) {
-    JSON.parse(response);
-    await fs.writeFile(DEFAULT_CLIENT_PATH, response + "\n", "utf8");
-    console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
-    rl.close();
-    return;
-  }
-
-  if (response === "path") {
-    const sourcePath = (await rl.question("Path to downloaded JSON: ")).trim();
-    await fs.copyFile(sourcePath, DEFAULT_CLIENT_PATH);
-    console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
-    rl.close();
-    return;
-  }
-  rl.close();
-
-  await fs.copyFile(response, DEFAULT_CLIENT_PATH);
-  console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
-}
-
-async function promptForOAuthCode(message?: string): Promise<string> {
-  const rl = readline.createInterface({ input, output });
-  if (message) {
-    console.log(message);
-  }
-  const code = (await rl.question("Code: ")).trim();
-  rl.close();
-  return code;
-}
-
-async function waitForOAuthCode(redirectUri: string): Promise<string> {
-  const url = new URL(redirectUri);
-  const port = Number(url.port || "80");
-  const hostname = url.hostname;
-  const pathname = url.pathname;
-
-  console.log(`Waiting for OAuth callback on ${redirectUri}`);
-
-  return await new Promise<string>((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      try {
-        if (!req.url) {
-          throw new Error("OAuth callback missing URL");
-        }
-        const requestUrl = new URL(req.url, redirectUri);
-        if (requestUrl.pathname !== pathname) {
-          res.statusCode = 404;
-          res.end("Not found");
-          return;
-        }
-        const code = requestUrl.searchParams.get("code");
-        const error = requestUrl.searchParams.get("error");
-        if (error) {
-          res.statusCode = 400;
-          res.end(`OAuth error: ${error}`);
-          server.close();
-          reject(new Error(`OAuth error: ${error}`));
-          return;
-        }
-        if (!code) {
-          res.statusCode = 400;
-          res.end("Missing code");
-          return;
-        }
-        res.end("Authorization received. You can return to the terminal.");
-        server.close();
-        resolve(code);
-      } catch (error) {
-        server.close();
-        reject(error);
-      }
-    });
-
-    server.once("error", reject);
-    server.listen(port, hostname);
+  const info = await transporter.sendMail({
+    from: config.emailAddress,
+    to: args.to,
+    subject: args.subject,
+    text: args.body,
+    inReplyTo: args.inReplyTo,
+    references: args.references,
   });
+
+  return normalizeMessageId(info.messageId);
 }
 
 async function loadState(statePath: string): Promise<BridgeState> {
@@ -355,7 +326,7 @@ async function loadState(statePath: string): Promise<BridgeState> {
     return JSON.parse(await fs.readFile(statePath, "utf8")) as BridgeState;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { gmailThreads: {} };
+      return { messageToThread: {}, processedUids: {} };
     }
     throw error;
   }
@@ -365,126 +336,34 @@ async function saveState(statePath: string, state: BridgeState): Promise<void> {
   await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
-function parseIncomingMessage(message: gmail_v1.Schema$Message) {
-  const payload = message.payload;
-  const headers = payload?.headers ?? [];
-  const subject = getHeader(headers, "Subject") || "(no subject)";
-  const from = extractEmailAddress(getHeader(headers, "From") || "");
-  const messageHeaderId = getHeader(headers, "Message-Id") || "";
-  const references = getHeader(headers, "References") || messageHeaderId;
-  const body = extractPlainTextBody(payload).trim();
-  return { subject, from, body, messageHeaderId, references };
+function normalizeReferences(value: string | string[] | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+  const raw = Array.isArray(value) ? value.join(" ") : value;
+  return raw
+    .split(/\s+/)
+    .map((part) => normalizeMessageId(part))
+    .filter((part): part is string => Boolean(part));
 }
 
-function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | undefined): string {
-  if (!payload) {
-    return "";
+function normalizeMessageId(value: string | undefined | null): string | null {
+  if (!value) {
+    return null;
   }
-
-  if (payload.mimeType === "text/plain" && payload.body?.data) {
-    return decodeBase64Url(payload.body.data);
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
   }
-
-  for (const part of payload.parts ?? []) {
-    const text = extractPlainTextBody(part);
-    if (text) {
-      return text;
-    }
-  }
-
-  if (payload.body?.data) {
-    return decodeBase64Url(payload.body.data);
-  }
-
-  return "";
-}
-
-function decodeBase64Url(value: string): string {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  return Buffer.from(normalized, "base64").toString("utf8");
-}
-
-function getHeader(headers: gmail_v1.Schema$MessagePartHeader[], name: string): string | null {
-  const match = headers.find((header) => header.name?.toLowerCase() === name.toLowerCase());
-  return match?.value ?? null;
-}
-
-function extractEmailAddress(value: string): string {
-  const match = value.match(/<([^>]+)>/);
-  return match?.[1] ?? value.trim();
+  return trimmed.startsWith("<") ? trimmed : `<${trimmed.replace(/[<>]/g, "")}>`;
 }
 
 function replySubject(subject: string): string {
   return /^re:/i.test(subject) ? subject : `Re: ${subject}`;
 }
 
-async function sendReply(
-  gmail: gmail_v1.Gmail,
-  args: {
-    to: string;
-    from: string;
-    subject: string;
-    body: string;
-    threadId: string;
-    inReplyTo?: string;
-    references?: string;
-  },
-): Promise<void> {
-  const lines = [
-    `From: ${args.from}`,
-    `To: ${args.to}`,
-    `Subject: ${args.subject}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "MIME-Version: 1.0",
-  ];
-  if (args.inReplyTo) {
-    lines.push(`In-Reply-To: ${args.inReplyTo}`);
-  }
-  if (args.references) {
-    lines.push(`References: ${args.references}`);
-  }
-  lines.push("", args.body);
-
-  const raw = Buffer.from(lines.join("\r\n"))
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-
-  await gmail.users.messages.send({
-    userId: "me",
-    requestBody: {
-      raw,
-      threadId: args.threadId,
-    },
-  });
-}
-
-async function markRead(gmail: gmail_v1.Gmail, messageId: string): Promise<void> {
-  await gmail.users.messages.modify({
-    userId: "me",
-    id: messageId,
-    requestBody: {
-      removeLabelIds: ["UNREAD"],
-    },
-  });
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shouldAutoListenForOAuthCode(redirectUri: string): boolean {
-  if (!(redirectUri.startsWith("http://127.0.0.1") || redirectUri.startsWith("http://localhost"))) {
-    return false;
-  }
-
-  const url = new URL(redirectUri);
-  if (!url.port) {
-    return false;
-  }
-
-  return Number(url.port) >= 1024;
 }
 
 function maybeOpenBrowser(url: string): void {

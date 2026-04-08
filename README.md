@@ -1,6 +1,6 @@
 # codex-gmail-bridge
 
-Turns a Gmail inbox into Codex threads on your own machine.
+Turns a Gmail inbox into Codex threads on your own machine using IMAP/SMTP.
 
 ## Setup
 
@@ -8,7 +8,7 @@ Turns a Gmail inbox into Codex threads on your own machine.
    `pnpm install`
 2. Bootstrap Gmail auth:
    `pnpm auth`
-   The command walks you through creating/downloading the Google OAuth desktop client and saving it locally.
+   The command asks for your Gmail address and an app password.
 3. Run the worker:
    `pnpm daemon`
 
@@ -26,7 +26,6 @@ Turns a Gmail inbox into Codex threads on your own machine.
 
 ## Environment
 
-- `CODEX_EMAIL_ADDRESS`
 - `CODEX_EMAIL_WORKDIR`
 - `CODEX_EMAIL_MODEL`
 - `CODEX_EMAIL_POLL_MS`
