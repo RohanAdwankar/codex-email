@@ -45,9 +45,6 @@ const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
 const DEFAULT_POLL_MS = 30_000;
-const GMAIL_QUICKSTART_URL = "https://developers.google.com/workspace/gmail/api/quickstart/nodejs";
-const GMAIL_API_ENABLE_URL = "https://console.cloud.google.com/apis/library/gmail.googleapis.com";
-const GOOGLE_AUTH_BRANDING_URL = "https://console.cloud.google.com/auth/branding";
 const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 
 async function main(): Promise<void> {
@@ -429,11 +426,8 @@ void main().catch((error) => {
     console.error("");
     console.error(`Expected file: ${DEFAULT_CLIENT_PATH}`);
     console.error("");
-    console.error("Create a Google Cloud desktop OAuth client for Gmail:");
-    console.error(`- Gmail API quickstart: ${GMAIL_QUICKSTART_URL}`);
-    console.error(`- Enable Gmail API: ${GMAIL_API_ENABLE_URL}`);
-    console.error(`- OAuth consent screen: ${GOOGLE_AUTH_BRANDING_URL}`);
-    console.error(`- OAuth clients: ${GOOGLE_AUTH_CLIENTS_URL}`);
+    console.error(`Open: ${GOOGLE_AUTH_CLIENTS_URL}`);
+    console.error("Create a project if needed, create a new OAuth client ID of type Desktop app, then download the JSON.");
     console.error("");
     console.error("After downloading the OAuth client JSON, place it here:");
     console.error(`mkdir -p ${APP_DIR}`);
