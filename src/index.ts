@@ -212,10 +212,11 @@ async function authorizeInteractive(): Promise<void> {
   console.log("Open this URL in a browser:");
   console.log(url);
 
-  const code =
-    redirectUri.startsWith("http://127.0.0.1") || redirectUri.startsWith("http://localhost")
-      ? await waitForOAuthCode(redirectUri)
-      : await promptForOAuthCode();
+  const code = shouldAutoListenForOAuthCode(redirectUri)
+    ? await waitForOAuthCode(redirectUri)
+    : await promptForOAuthCode(
+        "After approval, copy the `code` value from the browser URL and paste it here.",
+      );
 
   const { tokens } = await oauthClient.getToken(code);
   oauthClient.setCredentials(tokens);
@@ -291,8 +292,11 @@ async function ensureOauthClientFileInteractive(): Promise<void> {
   console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
 }
 
-async function promptForOAuthCode(): Promise<string> {
+async function promptForOAuthCode(message?: string): Promise<string> {
   const rl = readline.createInterface({ input, output });
+  if (message) {
+    console.log(message);
+  }
   const code = (await rl.question("Code: ")).trim();
   rl.close();
   return code;
@@ -468,6 +472,19 @@ async function markRead(gmail: gmail_v1.Gmail, messageId: string): Promise<void>
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldAutoListenForOAuthCode(redirectUri: string): boolean {
+  if (!(redirectUri.startsWith("http://127.0.0.1") || redirectUri.startsWith("http://localhost"))) {
+    return false;
+  }
+
+  const url = new URL(redirectUri);
+  if (!url.port) {
+    return false;
+  }
+
+  return Number(url.port) >= 1024;
 }
 
 function maybeOpenBrowser(url: string): void {
