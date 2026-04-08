@@ -147,6 +147,8 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
       continue;
     }
 
+    const threadMetadata = await fetchThreadMetadata(ctx.gmail, gmailThreadId);
+
     const thread = existing?.codexThreadId
       ? ctx.codex.resumeThread(existing.codexThreadId, codexThreadOptions(ctx))
       : ctx.codex.startThread(codexThreadOptions(ctx));
@@ -167,11 +169,11 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
     await sendReply(ctx.gmail, {
       to: parsed.from,
       from: ctx.emailAddress,
-      subject: replySubject(parsed.subject),
+      subject: threadMetadata.subject || parsed.subject,
       body: resultText,
       threadId: gmailThreadId,
-      inReplyTo: parsed.messageHeaderId,
-      references: parsed.references,
+      inReplyTo: threadMetadata.lastMessageId || parsed.messageHeaderId,
+      references: threadMetadata.references || parsed.references,
     });
 
     if (!thread.id) {
@@ -404,6 +406,38 @@ function parseIncomingMessage(message: gmail_v1.Schema$Message) {
   return { subject, from, body, messageHeaderId, references };
 }
 
+async function fetchThreadMetadata(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+): Promise<{ subject: string; lastMessageId: string; references: string }> {
+  const thread = await gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "full",
+  });
+
+  const messages = thread.data.messages ?? [];
+  const allMessageIds: string[] = [];
+  let subject = "";
+  let lastMessageId = "";
+
+  for (const message of messages) {
+    const headers = message.payload?.headers ?? [];
+    const currentSubject = getHeader(headers, "Subject");
+    const currentMessageId = normalizeMessageId(getHeader(headers, "Message-Id"));
+    if (!subject && currentSubject) {
+      subject = currentSubject;
+    }
+    if (currentMessageId) {
+      allMessageIds.push(currentMessageId);
+      lastMessageId = currentMessageId;
+    }
+  }
+
+  const references = Array.from(new Set(allMessageIds)).join(" ");
+  return { subject, lastMessageId, references };
+}
+
 function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | undefined): string {
   if (!payload) {
     return "";
@@ -451,10 +485,6 @@ function normalizeMessageId(value: string | null | undefined): string | null {
 function extractEmailAddress(value: string): string {
   const match = value.match(/<([^>]+)>/);
   return match?.[1] ?? value.trim();
-}
-
-function replySubject(subject: string): string {
-  return /^re:/i.test(subject) ? subject : `Re: ${subject}`;
 }
 
 async function sendReply(
