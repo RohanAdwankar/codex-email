@@ -1,0 +1,22 @@
+{
+  "name": "codex-gmail-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "auth": "tsx src/index.ts auth",
+    "run-once": "tsx src/index.ts run-once",
+    "daemon": "tsx src/index.ts daemon",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "0.118.0",
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.18",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2"
+  },
+  "packageManager": "pnpm@10.29.3"
+}
