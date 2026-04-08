@@ -394,8 +394,12 @@ function parseIncomingMessage(message: gmail_v1.Schema$Message) {
   const headers = payload?.headers ?? [];
   const subject = getHeader(headers, "Subject") || "(no subject)";
   const from = extractEmailAddress(getHeader(headers, "From") || "");
-  const messageHeaderId = getHeader(headers, "Message-Id") || "";
-  const references = getHeader(headers, "References") || messageHeaderId;
+  const messageHeaderId = normalizeMessageId(getHeader(headers, "Message-Id")) || "";
+  const references = buildReferenceChain(
+    getHeader(headers, "References"),
+    getHeader(headers, "In-Reply-To"),
+    messageHeaderId,
+  );
   const body = extractPlainTextBody(payload).trim();
   return { subject, from, body, messageHeaderId, references };
 }
@@ -433,6 +437,17 @@ function getHeader(headers: gmail_v1.Schema$MessagePartHeader[], name: string): 
   return match?.value ?? null;
 }
 
+function normalizeMessageId(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.startsWith("<") ? trimmed : `<${trimmed.replace(/[<>]/g, "")}>`;
+}
+
 function extractEmailAddress(value: string): string {
   const match = value.match(/<([^>]+)>/);
   return match?.[1] ?? value.trim();
@@ -462,10 +477,14 @@ async function sendReply(
     "MIME-Version: 1.0",
   ];
   if (args.inReplyTo) {
-    lines.push(`In-Reply-To: ${args.inReplyTo}`);
+    lines.push(`In-Reply-To: ${normalizeMessageId(args.inReplyTo)}`);
   }
   if (args.references) {
-    lines.push(`References: ${args.references}`);
+    const normalizedRefs = args.references
+      .split(/\s+/)
+      .map((value) => normalizeMessageId(value))
+      .filter((value): value is string => Boolean(value));
+    lines.push(`References: ${normalizedRefs.join(" ")}`);
   }
   lines.push("", args.body);
 
@@ -517,6 +536,14 @@ function maybeOpenBrowser(url: string): void {
       // try next opener
     }
   }
+}
+
+function buildReferenceChain(...values: Array<string | null | undefined>): string {
+  const normalized = values
+    .flatMap((value) => (value ?? "").split(/\s+/))
+    .map((value) => normalizeMessageId(value))
+    .filter((value, index, array): value is string => Boolean(value) && array.indexOf(value) === index);
+  return normalized.join(" ");
 }
 
 void main().catch((error) => {
