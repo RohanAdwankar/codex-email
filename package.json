@@ -10,14 +10,11 @@
   },
   "dependencies": {
     "@openai/codex-sdk": "0.118.0",
-    "imapflow": "^1.1.1",
-    "mailparser": "^3.7.5",
-    "nodemailer": "^7.0.5"
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^144.0.0"
   },
   "devDependencies": {
-    "@types/mailparser": "^3.4.6",
     "@types/node": "^20.19.18",
-    "@types/nodemailer": "^7.0.2",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2"
   },
