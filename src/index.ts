@@ -184,7 +184,7 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
     await sendReply(ctx.gmail, {
       to: parsed.from,
       from: ctx.emailAddress,
-      subject: threadMetadata.subject || parsed.subject,
+      subject: replySubject(threadMetadata.subject || parsed.subject),
       body: resultText,
       threadId: gmailThreadId,
       inReplyTo: threadMetadata.lastMessageId || parsed.messageHeaderId,
@@ -531,6 +531,10 @@ function normalizeMessageId(value: string | null | undefined): string | null {
 function extractEmailAddress(value: string): string {
   const match = value.match(/<([^>]+)>/);
   return match?.[1] ?? value.trim();
+}
+
+function replySubject(subject: string): string {
+  return /^re:/i.test(subject) ? subject : `Re: ${subject}`;
 }
 
 async function sendReply(
