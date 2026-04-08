@@ -17,6 +17,7 @@ Turns a Gmail inbox into Codex threads on your own machine.
 
 ## Behavior
 
+- Only mail from `rohan.adwankar@gmail.com` and `rohanchromebook@gmail.com` is processed by default.
 - A new inbound email starts a new Codex thread.
 - A reply in the same Gmail thread resumes the same Codex thread.
 - When Codex finishes, the bridge replies by email.
@@ -26,10 +27,12 @@ Turns a Gmail inbox into Codex threads on your own machine.
 - `pnpm auth`
 - `pnpm run-once`
 - `pnpm daemon`
+- `pnpm self-test`
 
 ## Environment
 
 - `CODEX_EMAIL_ADDRESS`
+- `CODEX_EMAIL_ALLOWED_SENDERS`
 - `CODEX_EMAIL_WORKDIR`
 - `CODEX_EMAIL_MODEL`
 - `CODEX_EMAIL_POLL_MS`

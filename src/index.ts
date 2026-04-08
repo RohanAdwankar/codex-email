@@ -45,13 +45,17 @@ const DEFAULT_CLIENT_PATH = path.join(APP_DIR, "google-oauth-client.json");
 const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
+const DEFAULT_ALLOWED_SENDERS = [
+  "rohan.adwankar@gmail.com",
+  DEFAULT_EMAIL_ADDRESS,
+];
 const DEFAULT_POLL_MS = 30_000;
 const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
-  if (!command || !["auth", "run-once", "daemon"].includes(command)) {
-    throw new Error("usage: tsx src/index.ts <auth|run-once|daemon>");
+  if (!command || !["auth", "run-once", "daemon", "self-test"].includes(command)) {
+    throw new Error("usage: tsx src/index.ts <auth|run-once|daemon|self-test>");
   }
 
   if (command === "auth") {
@@ -60,6 +64,11 @@ async function main(): Promise<void> {
   }
 
   const ctx = await createContext();
+  if (command === "self-test") {
+    await runSelfTest(ctx);
+    return;
+  }
+
   if (command === "run-once") {
     await processUnreadMessages(ctx);
     return;
@@ -76,6 +85,7 @@ type Context = {
   statePath: string;
   pollMs: number;
   emailAddress: string;
+  allowedSenders: Set<string>;
   codex: Codex;
   workdir: string;
   model?: string;
@@ -88,6 +98,7 @@ async function createContext(): Promise<Context> {
   const workdir = process.env.CODEX_EMAIL_WORKDIR || os.homedir();
   const pollMs = Number(process.env.CODEX_EMAIL_POLL_MS || DEFAULT_POLL_MS);
   const model = process.env.CODEX_EMAIL_MODEL;
+  const allowedSenders = parseAllowedSenders(process.env.CODEX_EMAIL_ALLOWED_SENDERS);
   const codex = new Codex();
 
   await fs.mkdir(APP_DIR, { recursive: true });
@@ -97,6 +108,7 @@ async function createContext(): Promise<Context> {
     statePath: DEFAULT_STATE_PATH,
     pollMs,
     emailAddress,
+    allowedSenders,
     codex,
     workdir,
     model,
@@ -107,7 +119,7 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
   const state = await loadState(ctx.statePath);
   const list = await ctx.gmail.users.messages.list({
     userId: "me",
-    q: `is:unread in:inbox to:${ctx.emailAddress} -from:me`,
+    q: buildInboxQuery(ctx),
     maxResults: 25,
   });
 
@@ -142,6 +154,9 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
     }
 
     const parsed = parseIncomingMessage(message);
+    if (!isAllowedSender(ctx, parsed.from)) {
+      continue;
+    }
     if (!parsed.body.trim()) {
       await markRead(ctx.gmail, messageId);
       continue;
@@ -189,6 +204,37 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
     await saveState(ctx.statePath, state);
     await markRead(ctx.gmail, messageId);
   }
+}
+
+async function runSelfTest(ctx: Context): Promise<void> {
+  const subject = `codex-email self-test ${new Date().toISOString()}`;
+  const body = "Reply to this email in the same thread with exactly: self-test ok";
+
+  const seed = await sendMessage(ctx.gmail, {
+    to: ctx.emailAddress,
+    from: ctx.emailAddress,
+    subject,
+    body,
+  });
+  const threadId = seed.threadId;
+  if (!threadId) {
+    throw new Error("Self-test seed email did not return a Gmail thread id.");
+  }
+
+  await waitForMessage(ctx.gmail, threadId);
+  await processUnreadMessages(ctx);
+
+  const thread = await ctx.gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "full",
+  });
+  const messages = thread.data.messages ?? [];
+  if (messages.length < 2) {
+    throw new Error(`Self-test failed: expected at least 2 messages in Gmail thread ${threadId}, got ${messages.length}.`);
+  }
+
+  console.log(`Self-test passed for Gmail thread ${threadId}.`);
 }
 
 function codexThreadOptions(ctx: Context) {
@@ -499,6 +545,21 @@ async function sendReply(
     references?: string;
   },
 ): Promise<void> {
+  await sendMessage(gmail, args);
+}
+
+async function sendMessage(
+  gmail: gmail_v1.Gmail,
+  args: {
+    to: string;
+    from: string;
+    subject: string;
+    body: string;
+    threadId?: string;
+    inReplyTo?: string;
+    references?: string;
+  },
+): Promise<gmail_v1.Schema$Message> {
   const lines = [
     `From: ${args.from}`,
     `To: ${args.to}`,
@@ -524,13 +585,14 @@ async function sendReply(
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
 
-  await gmail.users.messages.send({
+  const response = await gmail.users.messages.send({
     userId: "me",
     requestBody: {
       raw,
       threadId: args.threadId,
     },
   });
+  return response.data;
 }
 
 async function markRead(gmail: gmail_v1.Gmail, messageId: string): Promise<void> {
@@ -566,6 +628,39 @@ function maybeOpenBrowser(url: string): void {
       // try next opener
     }
   }
+}
+
+function parseAllowedSenders(value: string | undefined): Set<string> {
+  const configured = (value ?? DEFAULT_ALLOWED_SENDERS.join(","))
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(configured);
+}
+
+function buildInboxQuery(ctx: Context): string {
+  const senders = Array.from(ctx.allowedSenders).map((sender) => `from:${sender}`);
+  return `is:unread in:inbox to:${ctx.emailAddress} (${senders.join(" OR ")})`;
+}
+
+function isAllowedSender(ctx: Context, sender: string): boolean {
+  return ctx.allowedSenders.has(sender.trim().toLowerCase());
+}
+
+async function waitForMessage(gmail: gmail_v1.Gmail, threadId: string, timeoutMs = 15_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const thread = await gmail.users.threads.get({
+      userId: "me",
+      id: threadId,
+      format: "metadata",
+    });
+    if ((thread.data.messages ?? []).length > 0) {
+      return;
+    }
+    await sleep(1_000);
+  }
+  throw new Error(`Timed out waiting for Gmail thread ${threadId} to become visible.`);
 }
 
 function buildReferenceChain(...values: Array<string | null | undefined>): string {

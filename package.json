@@ -6,6 +6,7 @@
     "auth": "tsx src/index.ts auth",
     "run-once": "tsx src/index.ts run-once",
     "daemon": "tsx src/index.ts daemon",
+    "self-test": "tsx src/index.ts self-test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
