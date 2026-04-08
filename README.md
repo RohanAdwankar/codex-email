@@ -20,7 +20,9 @@ Turns a Gmail inbox into Codex threads on your own machine.
 - Only mail from `rohan.adwankar@gmail.com` and `rohanchromebook@gmail.com` is processed by default.
 - A new inbound email starts a new Codex thread.
 - A reply in the same Gmail thread resumes the same Codex thread.
-- When Codex finishes, the bridge replies by email.
+- Replies are sent as multipart email with plain text and HTML.
+- Markdown headings, lists, links, and code blocks render as HTML email.
+- Markdown images using local file paths are embedded inline when the file exists.
 
 ## Commands
 

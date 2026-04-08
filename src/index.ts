@@ -22,6 +22,14 @@ type BridgeState = {
   gmailThreads: Record<string, GmailThreadState>;
 };
 
+type InlineImage = {
+  alt: string;
+  cid: string;
+  content: Buffer;
+  contentType: string;
+  filename: string;
+};
+
 type OAuthClientConfig = {
   installed?: {
     client_id: string;
@@ -45,6 +53,7 @@ const DEFAULT_CLIENT_PATH = path.join(APP_DIR, "google-oauth-client.json");
 const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
+const DEFAULT_SUBJECT = "Codex Email";
 const DEFAULT_ALLOWED_SENDERS = [
   "rohan.adwankar@gmail.com",
   DEFAULT_EMAIL_ADDRESS,
@@ -189,6 +198,7 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
       threadId: gmailThreadId,
       inReplyTo: threadMetadata.lastMessageId || parsed.messageHeaderId,
       references: threadMetadata.references || parsed.references,
+      workdir: ctx.workdir,
     });
 
     if (!thread.id) {
@@ -440,7 +450,7 @@ async function saveState(statePath: string, state: BridgeState): Promise<void> {
 function parseIncomingMessage(message: gmail_v1.Schema$Message) {
   const payload = message.payload;
   const headers = payload?.headers ?? [];
-  const subject = getHeader(headers, "Subject") || "(no subject)";
+  const subject = normalizeSubject(getHeader(headers, "Subject"));
   const from = extractEmailAddress(getHeader(headers, "From") || "");
   const messageHeaderId = normalizeMessageId(getHeader(headers, "Message-Id")) || "";
   const references = buildReferenceChain(
@@ -469,7 +479,7 @@ async function fetchThreadMetadata(
 
   for (const message of messages) {
     const headers = message.payload?.headers ?? [];
-    const currentSubject = getHeader(headers, "Subject");
+    const currentSubject = normalizeSubject(getHeader(headers, "Subject"));
     const currentMessageId = normalizeMessageId(getHeader(headers, "Message-Id"));
     if (!subject && currentSubject) {
       subject = currentSubject;
@@ -533,8 +543,17 @@ function extractEmailAddress(value: string): string {
   return match?.[1] ?? value.trim();
 }
 
+function normalizeSubject(subject: string | null | undefined): string {
+  const trimmed = subject?.trim();
+  if (!trimmed || trimmed === "(no subject)") {
+    return DEFAULT_SUBJECT;
+  }
+  return trimmed;
+}
+
 function replySubject(subject: string): string {
-  return /^re:/i.test(subject) ? subject : `Re: ${subject}`;
+  const normalized = normalizeSubject(subject);
+  return /^re:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
 async function sendReply(
@@ -547,6 +566,7 @@ async function sendReply(
     threadId: string;
     inReplyTo?: string;
     references?: string;
+    workdir?: string;
   },
 ): Promise<void> {
   await sendMessage(gmail, args);
@@ -562,13 +582,14 @@ async function sendMessage(
     threadId?: string;
     inReplyTo?: string;
     references?: string;
+    workdir?: string;
   },
 ): Promise<gmail_v1.Schema$Message> {
+  const rendered = await renderEmailBody(args.body, args.workdir);
   const lines = [
     `From: ${args.from}`,
     `To: ${args.to}`,
-    `Subject: ${args.subject}`,
-    "Content-Type: text/plain; charset=utf-8",
+    `Subject: ${normalizeSubject(args.subject)}`,
     "MIME-Version: 1.0",
   ];
   if (args.inReplyTo) {
@@ -581,7 +602,35 @@ async function sendMessage(
       .filter((value): value is string => Boolean(value));
     lines.push(`References: ${normalizedRefs.join(" ")}`);
   }
-  lines.push("", args.body);
+  if (!rendered.html) {
+    lines.push("Content-Type: text/plain; charset=utf-8", "", rendered.text);
+  } else {
+    const relatedBoundary = createBoundary("related");
+    const alternativeBoundary = createBoundary("alt");
+    lines.push(`Content-Type: multipart/related; boundary="${relatedBoundary}"`, "");
+    lines.push(`--${relatedBoundary}`);
+    lines.push(`Content-Type: multipart/alternative; boundary="${alternativeBoundary}"`, "");
+    lines.push(`--${alternativeBoundary}`);
+    lines.push("Content-Type: text/plain; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: base64", "");
+    lines.push(...encodeMimeBase64(rendered.text), "");
+    lines.push(`--${alternativeBoundary}`);
+    lines.push("Content-Type: text/html; charset=utf-8");
+    lines.push("Content-Transfer-Encoding: base64", "");
+    lines.push(...encodeMimeBase64(rendered.html), "");
+    lines.push(`--${alternativeBoundary}--`);
+
+    for (const image of rendered.inlineImages) {
+      lines.push(`--${relatedBoundary}`);
+      lines.push(`Content-Type: ${image.contentType}; name="${image.filename}"`);
+      lines.push("Content-Transfer-Encoding: base64");
+      lines.push(`Content-Disposition: inline; filename="${image.filename}"`);
+      lines.push(`Content-ID: <${image.cid}>`, "");
+      lines.push(...encodeMimeBase64(image.content), "");
+    }
+
+    lines.push(`--${relatedBoundary}--`);
+  }
 
   const raw = Buffer.from(lines.join("\r\n"))
     .toString("base64")
@@ -607,6 +656,184 @@ async function markRead(gmail: gmail_v1.Gmail, messageId: string): Promise<void>
       removeLabelIds: ["UNREAD"],
     },
   });
+}
+
+async function renderEmailBody(markdown: string, workdir?: string): Promise<{
+  text: string;
+  html: string | null;
+  inlineImages: InlineImage[];
+}> {
+  const inlineImages = await collectInlineImages(markdown, workdir);
+  return {
+    text: renderMarkdownToText(markdown, inlineImages),
+    html: renderMarkdownToHtml(markdown, inlineImages),
+    inlineImages,
+  };
+}
+
+async function collectInlineImages(markdown: string, workdir?: string): Promise<InlineImage[]> {
+  const images: InlineImage[] = [];
+  const matches = Array.from(markdown.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g));
+  for (const [index, match] of matches.entries()) {
+    const resolvedPath = resolveLocalPath(match[2], workdir);
+    if (!resolvedPath) {
+      continue;
+    }
+    let content: Buffer;
+    try {
+      content = await fs.readFile(resolvedPath);
+    } catch {
+      continue;
+    }
+    const contentType = guessImageContentType(resolvedPath);
+    if (!contentType) {
+      continue;
+    }
+    images.push({
+      alt: match[1] || path.basename(resolvedPath),
+      cid: `codex-image-${Date.now()}-${index}@codex-email`,
+      content,
+      contentType,
+      filename: path.basename(resolvedPath),
+    });
+  }
+  return images;
+}
+
+function resolveLocalPath(rawPath: string, workdir?: string): string | null {
+  const trimmed = rawPath.trim().replace(/^<|>$/g, "").replace(/^['"]|['"]$/g, "");
+  if (!trimmed) {
+    return null;
+  }
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("cid:")) {
+    return null;
+  }
+  if (trimmed.startsWith("~/")) {
+    return path.join(os.homedir(), trimmed.slice(2));
+  }
+  if (path.isAbsolute(trimmed)) {
+    return trimmed;
+  }
+  return path.resolve(workdir || os.homedir(), trimmed);
+}
+
+function guessImageContentType(filePath: string): string | null {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".webp":
+      return "image/webp";
+    case ".svg":
+      return "image/svg+xml";
+    default:
+      return null;
+  }
+}
+
+function renderMarkdownToText(markdown: string, inlineImages: InlineImage[]): string {
+  let text = markdown;
+  for (const image of inlineImages) {
+    text = text.replace(
+      new RegExp(`!\\[[^\\]]*\\]\\([^)]*${escapeRegExp(image.filename)}[^)]*\\)`, "g"),
+      `[Image attached: ${image.alt}]`,
+    );
+  }
+  return text.trim() || "(No response text returned.)";
+}
+
+function renderMarkdownToHtml(markdown: string, inlineImages: InlineImage[]): string | null {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  const html: string[] = [];
+  let index = 0;
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.trim().startsWith("```")) {
+      if (inCodeBlock) {
+        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      index += 1;
+      continue;
+    }
+    if (inCodeBlock) {
+      codeLines.push(line);
+      index += 1;
+      continue;
+    }
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = heading[1].length;
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2], inlineImages)}</h${level}>`);
+      index += 1;
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^[-*]\s+/.test(lines[index])) {
+        items.push(`<li>${renderInlineMarkdown(lines[index].replace(/^[-*]\s+/, ""), inlineImages)}</li>`);
+        index += 1;
+      }
+      html.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+    const paragraph: string[] = [];
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !lines[index].trim().startsWith("```") &&
+      !/^(#{1,6})\s+/.test(lines[index]) &&
+      !/^[-*]\s+/.test(lines[index])
+    ) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "), inlineImages)}</p>`);
+  }
+
+  return html.length ? `<html><body>${html.join("\n")}</body></html>` : null;
+}
+
+function renderInlineMarkdown(value: string, inlineImages: InlineImage[]): string {
+  const imageMap = new Map(inlineImages.map((image) => [image.filename, image]));
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, (_match, code) => `<code>${escapeHtml(code)}</code>`);
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_match, label, url) => {
+    return `<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`;
+  });
+  html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, source) => {
+    const resolvedPath = resolveLocalPath(source);
+    const image = imageMap.get(path.basename(resolvedPath || source));
+    if (!image) {
+      return `<em>${escapeHtml(alt || "image")}</em>`;
+    }
+    return `<img src="cid:${image.cid}" alt="${escapeHtml(image.alt)}" style="max-width:100%; height:auto; display:block;" />`;
+  });
+  return html;
+}
+
+function createBoundary(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function encodeMimeBase64(value: string | Buffer): string[] {
+  const encoded = (typeof value === "string" ? Buffer.from(value, "utf8") : value).toString("base64");
+  return encoded.match(/.{1,76}/g) ?? [encoded];
 }
 
 function sleep(ms: number): Promise<void> {
@@ -673,6 +900,18 @@ function buildReferenceChain(...values: Array<string | null | undefined>): strin
     .map((value) => normalizeMessageId(value))
     .filter((value, index, array): value is string => Boolean(value) && array.indexOf(value) === index);
   return normalized.join(" ");
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 void main().catch((error) => {
