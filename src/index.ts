@@ -261,37 +261,33 @@ async function ensureOauthClientFileInteractive(): Promise<void> {
   console.log("");
   maybeOpenBrowser(GOOGLE_AUTH_CLIENTS_URL);
 
-  const mode = (
-    await rl.question("Enter 'path' to a downloaded JSON file, or 'paste' to paste the JSON here: ")
-  )
-    .trim()
-    .toLowerCase();
+  const response = (
+    await rl.question("Paste the downloaded JSON here, or type a file path to it: ")
+  ).trim();
 
-  if (mode === "path") {
+  if (!response) {
+    rl.close();
+    throw new Error("No OAuth client JSON or file path was provided.");
+  }
+
+  if (response.startsWith("{")) {
+    JSON.parse(response);
+    await fs.writeFile(DEFAULT_CLIENT_PATH, response + "\n", "utf8");
+    console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
+    rl.close();
+    return;
+  }
+
+  if (response === "path") {
     const sourcePath = (await rl.question("Path to downloaded JSON: ")).trim();
     await fs.copyFile(sourcePath, DEFAULT_CLIENT_PATH);
     console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
     rl.close();
     return;
   }
-
-  console.log("Paste the full JSON now. When done, type END on its own line.");
-  const lines: string[] = [];
-  for (;;) {
-    const line = await rl.question("");
-    if (line.trim() === "END") {
-      break;
-    }
-    lines.push(line);
-  }
   rl.close();
 
-  const raw = lines.join("\n").trim();
-  if (!raw) {
-    throw new Error("No OAuth client JSON was provided.");
-  }
-  JSON.parse(raw);
-  await fs.writeFile(DEFAULT_CLIENT_PATH, raw + "\n", "utf8");
+  await fs.copyFile(response, DEFAULT_CLIENT_PATH);
   console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
 }
 
