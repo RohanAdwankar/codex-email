@@ -3,6 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import os from "node:os";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
@@ -200,6 +201,7 @@ function codexThreadOptions(ctx: Context) {
 
 async function authorizeInteractive(): Promise<void> {
   await fs.mkdir(APP_DIR, { recursive: true });
+  await ensureOauthClientFileInteractive();
   const { oauthClient, redirectUri } = await buildOAuthClientFromDisk();
   const url = oauthClient.generateAuthUrl({
     access_type: "offline",
@@ -239,6 +241,58 @@ async function buildOAuthClientFromDisk(): Promise<{ oauthClient: OAuth2Client; 
     oauthClient: new google.auth.OAuth2(cfg.client_id, cfg.client_secret, redirectUri),
     redirectUri,
   };
+}
+
+async function ensureOauthClientFileInteractive(): Promise<void> {
+  try {
+    await fs.access(DEFAULT_CLIENT_PATH);
+    return;
+  } catch {
+    // fall through
+  }
+
+  await fs.mkdir(APP_DIR, { recursive: true });
+  const rl = readline.createInterface({ input, output });
+
+  console.log("");
+  console.log("Google OAuth setup is required once.");
+  console.log(`Open: ${GOOGLE_AUTH_CLIENTS_URL}`);
+  console.log("Create a project if needed, create a Desktop app OAuth client, and download the JSON.");
+  console.log("");
+  maybeOpenBrowser(GOOGLE_AUTH_CLIENTS_URL);
+
+  const mode = (
+    await rl.question("Enter 'path' to a downloaded JSON file, or 'paste' to paste the JSON here: ")
+  )
+    .trim()
+    .toLowerCase();
+
+  if (mode === "path") {
+    const sourcePath = (await rl.question("Path to downloaded JSON: ")).trim();
+    await fs.copyFile(sourcePath, DEFAULT_CLIENT_PATH);
+    console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
+    rl.close();
+    return;
+  }
+
+  console.log("Paste the full JSON now. When done, type END on its own line.");
+  const lines: string[] = [];
+  for (;;) {
+    const line = await rl.question("");
+    if (line.trim() === "END") {
+      break;
+    }
+    lines.push(line);
+  }
+  rl.close();
+
+  const raw = lines.join("\n").trim();
+  if (!raw) {
+    throw new Error("No OAuth client JSON was provided.");
+  }
+  JSON.parse(raw);
+  await fs.writeFile(DEFAULT_CLIENT_PATH, raw + "\n", "utf8");
+  console.log(`Saved OAuth client JSON to ${DEFAULT_CLIENT_PATH}`);
 }
 
 async function promptForOAuthCode(): Promise<string> {
@@ -420,32 +474,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-void main().catch((error) => {
-  if (isMissingOauthClientFile(error)) {
-    console.error("Missing Gmail OAuth client file.");
-    console.error("");
-    console.error(`Expected file: ${DEFAULT_CLIENT_PATH}`);
-    console.error("");
-    console.error(`Open: ${GOOGLE_AUTH_CLIENTS_URL}`);
-    console.error("Create a project if needed, create a new OAuth client ID of type Desktop app, then download the JSON.");
-    console.error("");
-    console.error("After downloading the OAuth client JSON, place it here:");
-    console.error(`mkdir -p ${APP_DIR}`);
-    console.error(`mv ~/Downloads/<client>.json ${DEFAULT_CLIENT_PATH}`);
-    process.exitCode = 1;
-    return;
+function maybeOpenBrowser(url: string): void {
+  const openers = [
+    ["xdg-open", url],
+    ["open", url],
+  ];
+
+  for (const [command, arg] of openers) {
+    try {
+      const child = spawn(command, [arg], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+      console.log(`Tried opening browser with ${command}.`);
+      return;
+    } catch {
+      // try next opener
+    }
   }
+}
+
+void main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-
-function isMissingOauthClientFile(error: unknown): error is NodeJS.ErrnoException {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as NodeJS.ErrnoException).code === "ENOENT" &&
-    "path" in error &&
-    (error as NodeJS.ErrnoException).path === DEFAULT_CLIENT_PATH
-  );
-}
