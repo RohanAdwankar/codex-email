@@ -53,6 +53,15 @@ type OAuthClientConfig = {
   };
 };
 
+type ParsedIncomingMessage = {
+  subject: string;
+  from: string;
+  body: string;
+  messageHeaderId: string;
+  references: string;
+  headers: gmail_v1.Schema$MessagePartHeader[];
+};
+
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/gmail.send",
@@ -62,9 +71,7 @@ const APP_DIR = path.join(os.homedir(), ".config", "codex-gmail-bridge");
 const DEFAULT_CLIENT_PATH = path.join(APP_DIR, "google-oauth-client.json");
 const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
-const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
 const DEFAULT_SUBJECT = "Codex Email";
-const DEFAULT_ALLOWED_SENDERS = ["rohan.adwankar@gmail.com"];
 const DEFAULT_POLL_MS = 30_000;
 const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 const MAILER_DAEMON_ADDRESS = "mailer-daemon@googlemail.com";
@@ -133,19 +140,33 @@ type Context = {
   codex: Codex;
   workdir: string;
   model?: string;
+  sandboxMode: "read-only" | "workspace-write" | "danger-full-access";
+  approvalPolicy: "untrusted" | "on-failure" | "on-request" | "never";
 };
 
 async function createContext(): Promise<Context> {
   const auth = await loadAuthorizedClient();
   const gmail = google.gmail({ version: "v1", auth });
-  const emailAddress = process.env.CODEX_EMAIL_ADDRESS || DEFAULT_EMAIL_ADDRESS;
+  const emailAddress = requireEnv("CODEX_EMAIL_ADDRESS");
   const workdir = process.env.CODEX_EMAIL_WORKDIR || os.homedir();
   const pollMs = Number(process.env.CODEX_EMAIL_POLL_MS || DEFAULT_POLL_MS);
   const model = process.env.CODEX_EMAIL_MODEL;
   const allowedSenders = parseAllowedSenders(process.env.CODEX_EMAIL_ALLOWED_SENDERS);
+  const sandboxMode = parseSandboxMode(process.env.CODEX_EMAIL_SANDBOX_MODE);
+  const approvalPolicy = parseApprovalPolicy(process.env.CODEX_EMAIL_APPROVAL_POLICY);
   const codex = new Codex();
 
   await fs.mkdir(APP_DIR, { recursive: true });
+  await ensureDirectoryExists(workdir, "CODEX_EMAIL_WORKDIR");
+  logEvent("daemon_started", {
+    emailAddress,
+    allowedSenders: Array.from(allowedSenders),
+    workdir,
+    pollMs,
+    sandboxMode,
+    approvalPolicy,
+    model: model || null,
+  });
 
   return {
     gmail,
@@ -156,6 +177,8 @@ async function createContext(): Promise<Context> {
     codex,
     workdir,
     model,
+    sandboxMode,
+    approvalPolicy,
   };
 }
 
@@ -198,10 +221,30 @@ async function processUnreadMessages(ctx: Context, options: ProcessOptions = {})
     }
 
     const parsed = parseIncomingMessage(message);
-    if (!isAllowedSender(ctx, parsed.from, options)) {
+    logEvent("received_email", {
+      messageId,
+      gmailThreadId,
+      from: parsed.from || getHeader(parsed.headers, "From") || "",
+      subject: parsed.subject,
+    });
+    if (!isAuthorizedMessage(ctx, parsed, existing, options)) {
+      logEvent("skipped_email", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from || getHeader(parsed.headers, "From") || "",
+        subject: parsed.subject,
+        reason: "authorization_failed",
+      });
       continue;
     }
     if (!parsed.body.trim()) {
+      logEvent("skipped_email", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from,
+        subject: parsed.subject,
+        reason: "empty_body",
+      });
       await markRead(ctx.gmail, messageId);
       continue;
     }
@@ -212,22 +255,53 @@ async function processUnreadMessages(ctx: Context, options: ProcessOptions = {})
       ? ctx.codex.resumeThread(existing.codexThreadId, codexThreadOptions(ctx))
       : ctx.codex.startThread(codexThreadOptions(ctx));
 
-    const participantMetadata = await fetchThreadParticipants(ctx.gmail, gmailThreadId, ctx.emailAddress);
+    const participantMetadata = await fetchThreadParticipants(
+      ctx.gmail,
+      gmailThreadId,
+      ctx.emailAddress,
+      ctx.allowedSenders,
+    );
+    if (isMailerDaemonSender(parsed.from) && (participantMetadata.hasUnsafeParticipant || !participantMetadata.replyTo)) {
+      logEvent("skipped_email", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from,
+        subject: parsed.subject,
+        reason: participantMetadata.hasUnsafeParticipant ? "unsafe_bounce_thread" : "missing_allowed_recipient",
+      });
+      await markRead(ctx.gmail, messageId);
+      continue;
+    }
     const prompt = isMailerDaemonSender(parsed.from)
       ? buildBounceRecoveryPrompt(parsed.body)
       : buildEmailPrompt(parsed.body, existing);
 
     let resultText: string;
     try {
+      logEvent("processing_email", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from,
+        subject: parsed.subject,
+        codexThreadId: existing?.codexThreadId || null,
+      });
       const result = await thread.run(prompt);
       resultText = result.finalResponse.trim() || "(No response text returned.)";
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
+      logEvent("codex_error", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from,
+        subject: parsed.subject,
+        error: messageText,
+      });
       resultText = `Codex run failed:\n\n${messageText}`;
     }
 
+    const replyTo = isMailerDaemonSender(parsed.from) ? participantMetadata.replyTo : parsed.from;
     await sendReply(ctx.gmail, {
-      to: isMailerDaemonSender(parsed.from) ? participantMetadata.replyTo : parsed.from,
+      to: replyTo,
       from: ctx.emailAddress,
       subject: replySubject(threadMetadata.subject || parsed.subject),
       body: resultText,
@@ -238,18 +312,30 @@ async function processUnreadMessages(ctx: Context, options: ProcessOptions = {})
       references: threadMetadata.references || parsed.references,
       workdir: ctx.workdir,
     });
+    logEvent("sent_email", {
+      messageId,
+      gmailThreadId,
+      to: replyTo,
+      subject: replySubject(threadMetadata.subject || parsed.subject),
+      codexThreadId: thread.id || null,
+    });
 
-    if (!thread.id) {
-      throw new Error(`Codex thread id missing after processing Gmail thread ${gmailThreadId}`);
+    if (thread.id) {
+      state.gmailThreads[gmailThreadId] = {
+        codexThreadId: thread.id,
+        lastProcessedMessageId: messageId,
+        subject: parsed.subject,
+        updatedAt: new Date().toISOString(),
+      };
+      await saveState(ctx.statePath, state);
+    } else {
+      logEvent("missing_thread_id", {
+        messageId,
+        gmailThreadId,
+        from: parsed.from,
+        subject: parsed.subject,
+      });
     }
-
-    state.gmailThreads[gmailThreadId] = {
-      codexThreadId: thread.id,
-      lastProcessedMessageId: messageId,
-      subject: parsed.subject,
-      updatedAt: new Date().toISOString(),
-    };
-    await saveState(ctx.statePath, state);
     await markRead(ctx.gmail, messageId);
   }
 }
@@ -351,8 +437,8 @@ function codexThreadOptions(ctx: Context) {
     model: ctx.model,
     workingDirectory: ctx.workdir,
     skipGitRepoCheck: true,
-    sandboxMode: "danger-full-access" as const,
-    approvalPolicy: "never" as const,
+    sandboxMode: ctx.sandboxMode,
+    approvalPolicy: ctx.approvalPolicy,
   };
 }
 
@@ -546,11 +632,28 @@ async function saveState(statePath: string, state: BridgeState): Promise<void> {
   await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
-function parseIncomingMessage(message: gmail_v1.Schema$Message) {
+async function ensureDirectoryExists(dirPath: string, envName: string): Promise<void> {
+  let stats;
+  try {
+    stats = await fs.stat(dirPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new Error(`${envName} does not exist: ${dirPath}`);
+    }
+    throw error;
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(`${envName} is not a directory: ${dirPath}`);
+  }
+}
+
+function parseIncomingMessage(message: gmail_v1.Schema$Message): ParsedIncomingMessage {
   const payload = message.payload;
   const headers = payload?.headers ?? [];
   const subject = normalizeSubject(getHeader(headers, "Subject"));
-  const from = extractEmailAddress(getHeader(headers, "From") || "");
+  const from = parseSingleMailboxAddress(getHeader(headers, "From") || "") || "";
   const messageHeaderId = normalizeMessageId(getHeader(headers, "Message-Id")) || "";
   const references = buildReferenceChain(
     getHeader(headers, "References"),
@@ -558,7 +661,7 @@ function parseIncomingMessage(message: gmail_v1.Schema$Message) {
     messageHeaderId,
   );
   const body = extractPlainTextBody(payload).trim();
-  return { subject, from, body, messageHeaderId, references };
+  return { subject, from, body, messageHeaderId, references, headers };
 }
 
 async function fetchThreadMetadata(
@@ -597,7 +700,8 @@ async function fetchThreadParticipants(
   gmail: gmail_v1.Gmail,
   threadId: string,
   selfEmail: string,
-): Promise<{ replyTo: string; lastUserMessageId: string }> {
+  allowedSenders: Set<string>,
+): Promise<{ replyTo: string; lastUserMessageId: string; hasUnsafeParticipant: boolean }> {
   const thread = await gmail.users.threads.get({
     userId: "me",
     id: threadId,
@@ -606,12 +710,21 @@ async function fetchThreadParticipants(
 
   let replyTo = "";
   let lastUserMessageId = "";
+  let hasUnsafeParticipant = false;
 
   for (const message of thread.data.messages ?? []) {
     const headers = message.payload?.headers ?? [];
-    const from = extractEmailAddress(getHeader(headers, "From") || "");
+    const from = parseSingleMailboxAddress(getHeader(headers, "From") || "") || "";
     const messageId = normalizeMessageId(getHeader(headers, "Message-Id")) || "";
-    if (!from || from.toLowerCase() === selfEmail.toLowerCase() || isMailerDaemonSender(from)) {
+    if (!from) {
+      hasUnsafeParticipant = true;
+      continue;
+    }
+    if (from.toLowerCase() === selfEmail.toLowerCase() || isMailerDaemonSender(from)) {
+      continue;
+    }
+    if (!allowedSenders.has(from.toLowerCase())) {
+      hasUnsafeParticipant = true;
       continue;
     }
     replyTo = from;
@@ -620,11 +733,7 @@ async function fetchThreadParticipants(
     }
   }
 
-  if (!replyTo) {
-    replyTo = DEFAULT_ALLOWED_SENDERS[0];
-  }
-
-  return { replyTo, lastUserMessageId };
+  return { replyTo, lastUserMessageId, hasUnsafeParticipant };
 }
 
 function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | undefined): string {
@@ -703,9 +812,28 @@ function normalizeMessageId(value: string | null | undefined): string | null {
   return trimmed.startsWith("<") ? trimmed : `<${trimmed.replace(/[<>]/g, "")}>`;
 }
 
-function extractEmailAddress(value: string): string {
-  const match = value.match(/<([^>]+)>/);
-  return match?.[1] ?? value.trim();
+function parseSingleMailboxAddress(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const bareAddress = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+  if (bareAddress.test(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+
+  const wrappedMatch = trimmed.match(/^([^<>]*)<([A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>$/);
+  if (!wrappedMatch) {
+    return null;
+  }
+
+  const displayName = wrappedMatch[1].trim();
+  if (displayName.includes("<") || displayName.includes(">")) {
+    return null;
+  }
+
+  return wrappedMatch[2].toLowerCase();
 }
 
 function normalizeSubject(subject: string | null | undefined): string {
@@ -1187,15 +1315,27 @@ function maybeOpenBrowser(url: string): void {
 }
 
 function parseAllowedSenders(value: string | undefined): Set<string> {
-  const configured = (value ?? DEFAULT_ALLOWED_SENDERS.join(","))
+  const configured = (value ?? "")
     .split(",")
     .map((entry) => entry.trim().toLowerCase())
     .filter(Boolean);
+  if (!configured.length) {
+    throw new Error("CODEX_EMAIL_ALLOWED_SENDERS must contain at least one email address");
+  }
   return new Set(configured);
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
 }
 
 function buildInboxQuery(ctx: Context, options: ProcessOptions = {}): string {
   const senders = Array.from(ctx.allowedSenders).map((sender) => `from:${sender}`);
+  senders.push(`from:${MAILER_DAEMON_ADDRESS}`);
   if (options.includeSelf) {
     senders.push(`from:${ctx.emailAddress}`);
   }
@@ -1204,19 +1344,105 @@ function buildInboxQuery(ctx: Context, options: ProcessOptions = {}): string {
   return `is:unread in:inbox to:${ctx.emailAddress}${threadQuery}${senderQuery ? ` ${senderQuery}` : ""}`;
 }
 
-function isAllowedSender(ctx: Context, sender: string, options: ProcessOptions = {}): boolean {
-  const normalized = sender.trim().toLowerCase();
-  if (options.includeSelf && normalized === ctx.emailAddress.toLowerCase()) {
-    return true;
-  }
-  if (normalized === MAILER_DAEMON_ADDRESS) {
-    return true;
-  }
-  return ctx.allowedSenders.has(normalized);
-}
-
 function isMailerDaemonSender(sender: string): boolean {
   return sender.trim().toLowerCase() === MAILER_DAEMON_ADDRESS;
+}
+
+function isAuthorizedMessage(
+  ctx: Context,
+  message: ParsedIncomingMessage,
+  existing: GmailThreadState | undefined,
+  options: ProcessOptions = {},
+): boolean {
+  if (!message.from) {
+    return false;
+  }
+
+  if (options.includeSelf && message.from === ctx.emailAddress.toLowerCase()) {
+    return true;
+  }
+
+  if (isMailerDaemonSender(message.from)) {
+    return Boolean(existing) && isAuthorizedDaemonMessage(message);
+  }
+
+  if (!ctx.allowedSenders.has(message.from)) {
+    return false;
+  }
+
+  return hasRequiredHumanSenderProof(ctx, message);
+}
+
+function hasRequiredHumanSenderProof(ctx: Context, message: ParsedIncomingMessage): boolean {
+  return hasPassingAuthenticationResults(message.headers, message.from);
+}
+
+function hasPassingAuthenticationResults(
+  headers: gmail_v1.Schema$MessagePartHeader[],
+  sender: string,
+): boolean {
+  const candidates = [
+    getHeader(headers, "Authentication-Results"),
+    getHeader(headers, "ARC-Authentication-Results"),
+  ].filter((value): value is string => Boolean(value));
+
+  if (!candidates.length) {
+    return false;
+  }
+
+  const senderDomain = sender.split("@")[1]?.toLowerCase();
+  if (!senderDomain) {
+    return false;
+  }
+
+  return candidates.some((value) => {
+    const normalized = value.toLowerCase();
+    return (
+      /\bdmarc=pass\b/.test(normalized) &&
+      /\bdkim=pass\b/.test(normalized) &&
+      /\bspf=pass\b/.test(normalized) &&
+      normalized.includes(`header.from=${senderDomain}`)
+    );
+  });
+}
+
+function parseSandboxMode(value: string | undefined): "read-only" | "workspace-write" | "danger-full-access" {
+  const normalized = (value || "danger-full-access").trim();
+  switch (normalized) {
+    case "read-only":
+    case "workspace-write":
+    case "danger-full-access":
+      return normalized;
+    default:
+      throw new Error("CODEX_EMAIL_SANDBOX_MODE must be read-only, workspace-write, or danger-full-access");
+  }
+}
+
+function parseApprovalPolicy(value: string | undefined): "untrusted" | "on-failure" | "on-request" | "never" {
+  const normalized = (value || "never").trim();
+  switch (normalized) {
+    case "untrusted":
+    case "on-failure":
+    case "on-request":
+    case "never":
+      return normalized;
+    default:
+      throw new Error("CODEX_EMAIL_APPROVAL_POLICY must be untrusted, on-failure, on-request, or never");
+  }
+}
+
+function isAuthorizedDaemonMessage(message: ParsedIncomingMessage): boolean {
+  return hasPassingAuthenticationResults(message.headers, MAILER_DAEMON_ADDRESS);
+}
+
+function logEvent(event: string, details: Record<string, unknown>): void {
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      event,
+      ...details,
+    }),
+  );
 }
 
 async function waitForMessage(gmail: gmail_v1.Gmail, threadId: string, timeoutMs = 15_000): Promise<void> {
