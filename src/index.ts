@@ -54,10 +54,7 @@ const DEFAULT_TOKEN_PATH = path.join(APP_DIR, "google-oauth-token.json");
 const DEFAULT_STATE_PATH = path.join(APP_DIR, "state.json");
 const DEFAULT_EMAIL_ADDRESS = "rohanchromebook@gmail.com";
 const DEFAULT_SUBJECT = "Codex Email";
-const DEFAULT_ALLOWED_SENDERS = [
-  "rohan.adwankar@gmail.com",
-  DEFAULT_EMAIL_ADDRESS,
-];
+const DEFAULT_ALLOWED_SENDERS = ["rohan.adwankar@gmail.com"];
 const DEFAULT_POLL_MS = 30_000;
 const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 
@@ -88,6 +85,11 @@ async function main(): Promise<void> {
     await sleep(ctx.pollMs);
   }
 }
+
+type ProcessOptions = {
+  includeSelf?: boolean;
+  threadId?: string;
+};
 
 type Context = {
   gmail: gmail_v1.Gmail;
@@ -124,11 +126,11 @@ async function createContext(): Promise<Context> {
   };
 }
 
-async function processUnreadMessages(ctx: Context): Promise<void> {
+async function processUnreadMessages(ctx: Context, options: ProcessOptions = {}): Promise<void> {
   const state = await loadState(ctx.statePath);
   const list = await ctx.gmail.users.messages.list({
     userId: "me",
-    q: buildInboxQuery(ctx),
+    q: buildInboxQuery(ctx, options),
     maxResults: 25,
   });
 
@@ -163,7 +165,7 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
     }
 
     const parsed = parseIncomingMessage(message);
-    if (!isAllowedSender(ctx, parsed.from)) {
+    if (!isAllowedSender(ctx, parsed.from, options)) {
       continue;
     }
     if (!parsed.body.trim()) {
@@ -177,9 +179,7 @@ async function processUnreadMessages(ctx: Context): Promise<void> {
       ? ctx.codex.resumeThread(existing.codexThreadId, codexThreadOptions(ctx))
       : ctx.codex.startThread(codexThreadOptions(ctx));
 
-    const prompt = existing
-      ? parsed.body
-      : `You are replying by email. Keep the response concise and plain text unless formatting is clearly useful.\n\n${parsed.body}`;
+    const prompt = buildEmailPrompt(parsed.body, existing);
 
     let resultText: string;
     try {
@@ -232,7 +232,7 @@ async function runSelfTest(ctx: Context): Promise<void> {
   }
 
   await waitForMessage(ctx.gmail, threadId);
-  await processUnreadMessages(ctx);
+  await processUnreadMessages(ctx, { includeSelf: true, threadId });
 
   const thread = await ctx.gmail.users.threads.get({
     userId: "me",
@@ -556,6 +556,24 @@ function replySubject(subject: string): string {
   return /^re:/i.test(normalized) ? normalized : `Re: ${normalized}`;
 }
 
+function buildEmailPrompt(body: string, existing: boolean): string {
+  const instructions = [
+    "You are replying by email.",
+    "Use plain text unless markdown formatting is clearly useful.",
+    "Markdown headings, lists, links, code blocks, and markdown images are supported by the mail bridge.",
+    "If you generate a local raster image file, embed it by including markdown image syntax with the real local file path, for example: ![diagram](/absolute/path/to/file.png).",
+    "Do not return raw HTML email bodies, MIME instructions, cid: references, or fenced HTML unless the user explicitly asks for source code.",
+    "Do not put image markdown inside code fences.",
+    "Prefer PNG, JPG, GIF, or WebP for inline email images. SVG is unreliable in Gmail.",
+  ].join(" ");
+
+  if (existing) {
+    return `${instructions}\n\n${body}`;
+  }
+
+  return `${instructions}\n\n${body}`;
+}
+
 async function sendReply(
   gmail: gmail_v1.Gmail,
   args: {
@@ -869,13 +887,22 @@ function parseAllowedSenders(value: string | undefined): Set<string> {
   return new Set(configured);
 }
 
-function buildInboxQuery(ctx: Context): string {
+function buildInboxQuery(ctx: Context, options: ProcessOptions = {}): string {
   const senders = Array.from(ctx.allowedSenders).map((sender) => `from:${sender}`);
-  return `is:unread in:inbox to:${ctx.emailAddress} (${senders.join(" OR ")})`;
+  if (options.includeSelf) {
+    senders.push(`from:${ctx.emailAddress}`);
+  }
+  const senderQuery = senders.length ? `(${senders.join(" OR ")})` : "";
+  const threadQuery = options.threadId ? ` thread:${options.threadId}` : "";
+  return `is:unread in:inbox to:${ctx.emailAddress}${threadQuery}${senderQuery ? ` ${senderQuery}` : ""}`;
 }
 
-function isAllowedSender(ctx: Context, sender: string): boolean {
-  return ctx.allowedSenders.has(sender.trim().toLowerCase());
+function isAllowedSender(ctx: Context, sender: string, options: ProcessOptions = {}): boolean {
+  const normalized = sender.trim().toLowerCase();
+  if (options.includeSelf && normalized === ctx.emailAddress.toLowerCase()) {
+    return true;
+  }
+  return ctx.allowedSenders.has(normalized);
 }
 
 async function waitForMessage(gmail: gmail_v1.Gmail, threadId: string, timeoutMs = 15_000): Promise<void> {
