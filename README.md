@@ -23,6 +23,7 @@ Turns a Gmail inbox into Codex threads on your own machine.
 - Replies are sent as multipart email with plain text and HTML.
 - Markdown headings, lists, links, and code blocks render as HTML email.
 - Markdown images using local file paths are embedded inline when the file exists.
+- Local markdown links to generated files are promoted into email artifacts: raster images inline, other files attached.
 
 ## Commands
 

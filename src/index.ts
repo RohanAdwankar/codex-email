@@ -28,6 +28,15 @@ type InlineImage = {
   content: Buffer;
   contentType: string;
   filename: string;
+  sourcePath: string;
+};
+
+type Attachment = {
+  label: string;
+  content: Buffer;
+  contentType: string;
+  filename: string;
+  sourcePath: string;
 };
 
 type OAuthClientConfig = {
@@ -756,6 +765,14 @@ async function sendMessage(
       lines.push(...encodeMimeBase64(image.content), "");
     }
 
+    for (const attachment of rendered.attachments) {
+      lines.push(`--${relatedBoundary}`);
+      lines.push(`Content-Type: ${attachment.contentType}; name="${attachment.filename}"`);
+      lines.push("Content-Transfer-Encoding: base64");
+      lines.push(`Content-Disposition: attachment; filename="${attachment.filename}"`, "");
+      lines.push(...encodeMimeBase64(attachment.content), "");
+    }
+
     lines.push(`--${relatedBoundary}--`);
   }
 
@@ -789,19 +806,27 @@ async function renderEmailBody(markdown: string, workdir?: string): Promise<{
   text: string;
   html: string | null;
   inlineImages: InlineImage[];
+  attachments: Attachment[];
 }> {
-  const inlineImages = await collectInlineImages(markdown, workdir);
+  const { inlineImages, attachments } = await collectArtifacts(markdown, workdir);
   return {
-    text: renderMarkdownToText(markdown, inlineImages),
-    html: renderMarkdownToHtml(markdown, inlineImages),
+    text: renderMarkdownToText(markdown, inlineImages, attachments),
+    html: renderMarkdownToHtml(markdown, inlineImages, attachments),
     inlineImages,
+    attachments,
   };
 }
 
-async function collectInlineImages(markdown: string, workdir?: string): Promise<InlineImage[]> {
+async function collectArtifacts(
+  markdown: string,
+  workdir?: string,
+): Promise<{ inlineImages: InlineImage[]; attachments: Attachment[] }> {
   const images: InlineImage[] = [];
-  const matches = Array.from(markdown.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g));
-  for (const [index, match] of matches.entries()) {
+  const attachments: Attachment[] = [];
+  const seenPaths = new Set<string>();
+  const imageMatches = Array.from(markdown.matchAll(/!\[([^\]]*)\]\(([^)]+)\)/g));
+  const linkMatches = Array.from(markdown.matchAll(/\[([^\]]+)\]\(([^)]+)\)/g));
+  for (const [index, match] of imageMatches.entries()) {
     const resolvedPath = resolveLocalPath(match[2], workdir);
     if (!resolvedPath) {
       continue;
@@ -816,15 +841,62 @@ async function collectInlineImages(markdown: string, workdir?: string): Promise<
     if (!contentType) {
       continue;
     }
+    seenPaths.add(resolvedPath);
+    if (contentType === "image/svg+xml") {
+      attachments.push({
+        label: match[1] || path.basename(resolvedPath),
+        content,
+        contentType,
+        filename: path.basename(resolvedPath),
+        sourcePath: resolvedPath,
+      });
+      continue;
+    }
     images.push({
       alt: match[1] || path.basename(resolvedPath),
       cid: `codex-image-${Date.now()}-${index}@codex-email`,
       content,
       contentType,
       filename: path.basename(resolvedPath),
+      sourcePath: resolvedPath,
     });
   }
-  return images;
+
+  for (const match of linkMatches) {
+    const resolvedPath = resolveLocalPath(match[2], workdir);
+    if (!resolvedPath || seenPaths.has(resolvedPath)) {
+      continue;
+    }
+    let content: Buffer;
+    try {
+      content = await fs.readFile(resolvedPath);
+    } catch {
+      continue;
+    }
+    const imageContentType = guessImageContentType(resolvedPath);
+    if (imageContentType && imageContentType !== "image/svg+xml") {
+      seenPaths.add(resolvedPath);
+      images.push({
+        alt: match[1] || path.basename(resolvedPath),
+        cid: `codex-image-${Date.now()}-${images.length}@codex-email`,
+        content,
+        contentType: imageContentType,
+        filename: path.basename(resolvedPath),
+        sourcePath: resolvedPath,
+      });
+      continue;
+    }
+    seenPaths.add(resolvedPath);
+    attachments.push({
+      label: match[1] || path.basename(resolvedPath),
+      content,
+      contentType: guessAttachmentContentType(resolvedPath),
+      filename: path.basename(resolvedPath),
+      sourcePath: resolvedPath,
+    });
+  }
+
+  return { inlineImages: images, attachments };
 }
 
 function resolveLocalPath(rawPath: string, workdir?: string): string | null {
@@ -863,18 +935,50 @@ function guessImageContentType(filePath: string): string | null {
   }
 }
 
-function renderMarkdownToText(markdown: string, inlineImages: InlineImage[]): string {
+function guessAttachmentContentType(filePath: string): string {
+  const imageType = guessImageContentType(filePath);
+  if (imageType) {
+    return imageType;
+  }
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".svg":
+      return "image/svg+xml";
+    case ".txt":
+    case ".md":
+      return "text/plain; charset=utf-8";
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".json":
+      return "application/json";
+    case ".pdf":
+      return "application/pdf";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function renderMarkdownToText(markdown: string, inlineImages: InlineImage[], attachments: Attachment[]): string {
   let text = markdown;
   for (const image of inlineImages) {
     text = text.replace(
-      new RegExp(`!\\[[^\\]]*\\]\\([^)]*${escapeRegExp(image.filename)}[^)]*\\)`, "g"),
+      new RegExp(`!\\[[^\\]]*\\]\\([^)]*${escapeRegExp(image.sourcePath)}[^)]*\\)`, "g"),
       `[Image attached: ${image.alt}]`,
+    );
+    text = text.replace(
+      new RegExp(`\\[[^\\]]+\\]\\([^)]*${escapeRegExp(image.sourcePath)}[^)]*\\)`, "g"),
+      `[Image attached: ${image.alt}]`,
+    );
+  }
+  for (const attachment of attachments) {
+    text = text.replace(
+      new RegExp(`\\[[^\\]]+\\]\\([^)]*${escapeRegExp(attachment.sourcePath)}[^)]*\\)`, "g"),
+      `[Attachment: ${attachment.filename}]`,
     );
   }
   return text.trim() || "(No response text returned.)";
 }
 
-function renderMarkdownToHtml(markdown: string, inlineImages: InlineImage[]): string | null {
+function renderMarkdownToHtml(markdown: string, inlineImages: InlineImage[], attachments: Attachment[]): string | null {
   const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const html: string[] = [];
   let index = 0;
@@ -906,14 +1010,14 @@ function renderMarkdownToHtml(markdown: string, inlineImages: InlineImage[]): st
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
       const level = heading[1].length;
-      html.push(`<h${level}>${renderInlineMarkdown(heading[2], inlineImages)}</h${level}>`);
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2], inlineImages, attachments)}</h${level}>`);
       index += 1;
       continue;
     }
     if (/^[-*]\s+/.test(line)) {
       const items: string[] = [];
       while (index < lines.length && /^[-*]\s+/.test(lines[index])) {
-        items.push(`<li>${renderInlineMarkdown(lines[index].replace(/^[-*]\s+/, ""), inlineImages)}</li>`);
+        items.push(`<li>${renderInlineMarkdown(lines[index].replace(/^[-*]\s+/, ""), inlineImages, attachments)}</li>`);
         index += 1;
       }
       html.push(`<ul>${items.join("")}</ul>`);
@@ -930,14 +1034,15 @@ function renderMarkdownToHtml(markdown: string, inlineImages: InlineImage[]): st
       paragraph.push(lines[index]);
       index += 1;
     }
-    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "), inlineImages)}</p>`);
+    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "), inlineImages, attachments)}</p>`);
   }
 
   return html.length ? `<html><body>${html.join("\n")}</body></html>` : null;
 }
 
-function renderInlineMarkdown(value: string, inlineImages: InlineImage[]): string {
-  const imageMap = new Map(inlineImages.map((image) => [image.filename, image]));
+function renderInlineMarkdown(value: string, inlineImages: InlineImage[], attachments: Attachment[]): string {
+  const imageMap = new Map(inlineImages.map((image) => [image.sourcePath, image]));
+  const attachmentMap = new Map(attachments.map((attachment) => [attachment.sourcePath, attachment]));
   let html = escapeHtml(value);
   html = html.replace(/`([^`]+)`/g, (_match, code) => `<code>${escapeHtml(code)}</code>`);
   html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_match, label, url) => {
@@ -945,11 +1050,26 @@ function renderInlineMarkdown(value: string, inlineImages: InlineImage[]): strin
   });
   html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, source) => {
     const resolvedPath = resolveLocalPath(source);
-    const image = imageMap.get(path.basename(resolvedPath || source));
+    const image = resolvedPath ? imageMap.get(resolvedPath) : undefined;
     if (!image) {
       return `<em>${escapeHtml(alt || "image")}</em>`;
     }
     return `<img src="cid:${image.cid}" alt="${escapeHtml(image.alt)}" style="max-width:100%; height:auto; display:block;" />`;
+  });
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, source) => {
+    const resolvedPath = resolveLocalPath(source);
+    if (!resolvedPath) {
+      return escapeHtml(label);
+    }
+    const image = imageMap.get(resolvedPath);
+    if (image) {
+      return `<img src="cid:${image.cid}" alt="${escapeHtml(image.alt)}" style="max-width:100%; height:auto; display:block;" />`;
+    }
+    const attachment = attachmentMap.get(resolvedPath);
+    if (attachment) {
+      return `<em>Attached file: ${escapeHtml(attachment.filename)}</em>`;
+    }
+    return escapeHtml(label);
   });
   return html;
 }
