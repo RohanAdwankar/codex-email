@@ -30,6 +30,8 @@ Turns a Gmail inbox into Codex threads on your own machine.
 - `pnpm run-once`
 - `pnpm daemon`
 - `pnpm self-test`
+- `pnpm list-emails -- '<gmail search query>'`
+- `pnpm read-email -- <gmail-message-id>`
 
 ## Environment
 

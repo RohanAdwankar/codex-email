@@ -7,6 +7,8 @@
     "run-once": "tsx src/index.ts run-once",
     "daemon": "tsx src/index.ts daemon",
     "self-test": "tsx src/index.ts self-test",
+    "list-emails": "tsx src/index.ts list-emails",
+    "read-email": "tsx src/index.ts read-email",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

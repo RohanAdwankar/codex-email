@@ -60,8 +60,9 @@ const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
-  if (!command || !["auth", "run-once", "daemon", "self-test"].includes(command)) {
-    throw new Error("usage: tsx src/index.ts <auth|run-once|daemon|self-test>");
+  const commandArgs = process.argv.slice(3).filter((value) => value !== "--");
+  if (!command || !["auth", "run-once", "daemon", "self-test", "list-emails", "read-email"].includes(command)) {
+    throw new Error("usage: tsx src/index.ts <auth|run-once|daemon|self-test|list-emails|read-email>");
   }
 
   if (command === "auth") {
@@ -72,6 +73,20 @@ async function main(): Promise<void> {
   const ctx = await createContext();
   if (command === "self-test") {
     await runSelfTest(ctx);
+    return;
+  }
+
+  if (command === "list-emails") {
+    await listEmails(ctx, commandArgs.join(" "));
+    return;
+  }
+
+  if (command === "read-email") {
+    const messageId = commandArgs[0];
+    if (!messageId) {
+      throw new Error("usage: tsx src/index.ts read-email <gmail-message-id>");
+    }
+    await readEmail(ctx, messageId);
     return;
   }
 
@@ -245,6 +260,67 @@ async function runSelfTest(ctx: Context): Promise<void> {
   }
 
   console.log(`Self-test passed for Gmail thread ${threadId}.`);
+}
+
+async function listEmails(ctx: Context, query?: string): Promise<void> {
+  const list = await ctx.gmail.users.messages.list({
+    userId: "me",
+    q: query?.trim() || undefined,
+    maxResults: 25,
+  });
+  const messages = await Promise.all(
+    (list.data.messages ?? []).map((message) =>
+      ctx.gmail.users.messages.get({
+        userId: "me",
+        id: message.id!,
+        format: "metadata",
+        metadataHeaders: ["Subject", "From", "To", "Date"],
+      }),
+    ),
+  );
+  console.log(
+    JSON.stringify(
+      messages.map((response) => {
+        const headers = response.data.payload?.headers ?? [];
+        return {
+          id: response.data.id,
+          threadId: response.data.threadId,
+          subject: getHeader(headers, "Subject") || "",
+          from: getHeader(headers, "From") || "",
+          to: getHeader(headers, "To") || "",
+          date: getHeader(headers, "Date") || "",
+        };
+      }),
+      null,
+      2,
+    ),
+  );
+}
+
+async function readEmail(ctx: Context, messageId: string): Promise<void> {
+  const message = (
+    await ctx.gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "full",
+    })
+  ).data;
+  const headers = message.payload?.headers ?? [];
+  console.log(
+    JSON.stringify(
+      {
+        id: message.id,
+        threadId: message.threadId,
+        subject: getHeader(headers, "Subject") || "",
+        from: getHeader(headers, "From") || "",
+        to: getHeader(headers, "To") || "",
+        date: getHeader(headers, "Date") || "",
+        parts: collectMessageParts(message.payload),
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 function codexThreadOptions(ctx: Context) {
@@ -527,6 +603,38 @@ function getHeader(headers: gmail_v1.Schema$MessagePartHeader[], name: string): 
   return match?.value ?? null;
 }
 
+function collectMessageParts(
+  part: gmail_v1.Schema$MessagePart | undefined,
+  depth = 0,
+): Array<{
+  depth: number;
+  mimeType: string | null | undefined;
+  filename: string;
+  headers: Record<string, string>;
+  body: string | null;
+}> {
+  if (!part) {
+    return [];
+  }
+  const headers = Object.fromEntries(
+    (part.headers ?? [])
+      .filter((header) =>
+        ["Content-Type", "Content-Disposition", "Content-ID", "Content-Transfer-Encoding"].includes(header.name || ""),
+      )
+      .map((header) => [header.name || "", header.value || ""]),
+  );
+  return [
+    {
+      depth,
+      mimeType: part.mimeType,
+      filename: part.filename || "",
+      headers,
+      body: part.body?.data ? decodeBase64Url(part.body.data) : null,
+    },
+    ...(part.parts ?? []).flatMap((child) => collectMessageParts(child, depth + 1)),
+  ];
+}
+
 function normalizeMessageId(value: string | null | undefined): string | null {
   if (!value) {
     return null;
@@ -559,9 +667,10 @@ function replySubject(subject: string): string {
 function buildEmailPrompt(body: string, existing: boolean): string {
   const instructions = [
     "You are replying by email.",
-    "Use plain text unless markdown formatting is clearly useful.",
+    "Always respond in markdown.",
     "Markdown headings, lists, links, code blocks, and markdown images are supported by the mail bridge.",
     "If you generate a local raster image file, embed it by including markdown image syntax with the real local file path, for example: ![diagram](/absolute/path/to/file.png).",
+    "If you refer to a generated local image file, use markdown image syntax instead of a normal markdown link.",
     "Do not return raw HTML email bodies, MIME instructions, cid: references, or fenced HTML unless the user explicitly asks for source code.",
     "Do not put image markdown inside code fences.",
     "Prefer PNG, JPG, GIF, or WebP for inline email images. SVG is unreliable in Gmail.",
