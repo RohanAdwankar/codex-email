@@ -6,6 +6,7 @@
     "auth": "tsx src/index.ts auth",
     "run-once": "tsx src/index.ts run-once",
     "daemon": "tsx src/index.ts daemon",
+    "dev-daemon": "tsx watch src/index.ts daemon",
     "self-test": "tsx src/index.ts self-test",
     "list-emails": "tsx src/index.ts list-emails",
     "read-email": "tsx src/index.ts read-email",
