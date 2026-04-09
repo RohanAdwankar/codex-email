@@ -9,3 +9,4 @@
 - `pnpm self-test`: send a self-test thread and verify the reply path.
 - `pnpm list-emails -- '<gmail search query>'`: list matching emails with ids and thread ids.
 - `pnpm read-email -- <gmail-message-id>`: dump a message and its MIME parts.
+- Blocked Gmail attachment extensions are automatically renamed to safe `.txt` attachments before send.

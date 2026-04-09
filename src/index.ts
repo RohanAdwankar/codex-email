@@ -37,6 +37,7 @@ type Attachment = {
   contentType: string;
   filename: string;
   sourcePath: string;
+  originalFilename?: string;
 };
 
 type OAuthClientConfig = {
@@ -66,6 +67,14 @@ const DEFAULT_SUBJECT = "Codex Email";
 const DEFAULT_ALLOWED_SENDERS = ["rohan.adwankar@gmail.com"];
 const DEFAULT_POLL_MS = 30_000;
 const GOOGLE_AUTH_CLIENTS_URL = "https://console.cloud.google.com/auth/clients";
+const MAILER_DAEMON_ADDRESS = "mailer-daemon@googlemail.com";
+const GMAIL_BLOCKED_EXTENSIONS = new Set([
+  ".ade", ".adp", ".apk", ".appx", ".appxbundle", ".bat", ".cab", ".chm", ".cmd", ".com", ".cpl",
+  ".diagcab", ".diagcfg", ".diagpkg", ".dll", ".dmg", ".ex", ".ex_", ".exe", ".hta", ".img", ".ins",
+  ".iso", ".isp", ".jar", ".jnlp", ".js", ".jse", ".lib", ".lnk", ".mde", ".mjs", ".msc", ".msi",
+  ".msix", ".msixbundle", ".msp", ".mst", ".nsh", ".pif", ".ps1", ".scr", ".sct", ".shb", ".sys",
+  ".vb", ".vbe", ".vbs", ".vhd", ".vxd", ".wsc", ".wsf", ".wsh", ".xll",
+]);
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -203,7 +212,10 @@ async function processUnreadMessages(ctx: Context, options: ProcessOptions = {})
       ? ctx.codex.resumeThread(existing.codexThreadId, codexThreadOptions(ctx))
       : ctx.codex.startThread(codexThreadOptions(ctx));
 
-    const prompt = buildEmailPrompt(parsed.body, existing);
+    const participantMetadata = await fetchThreadParticipants(ctx.gmail, gmailThreadId, ctx.emailAddress);
+    const prompt = isMailerDaemonSender(parsed.from)
+      ? buildBounceRecoveryPrompt(parsed.body)
+      : buildEmailPrompt(parsed.body, existing);
 
     let resultText: string;
     try {
@@ -215,12 +227,14 @@ async function processUnreadMessages(ctx: Context, options: ProcessOptions = {})
     }
 
     await sendReply(ctx.gmail, {
-      to: parsed.from,
+      to: isMailerDaemonSender(parsed.from) ? participantMetadata.replyTo : parsed.from,
       from: ctx.emailAddress,
       subject: replySubject(threadMetadata.subject || parsed.subject),
       body: resultText,
       threadId: gmailThreadId,
-      inReplyTo: threadMetadata.lastMessageId || parsed.messageHeaderId,
+      inReplyTo: isMailerDaemonSender(parsed.from)
+        ? participantMetadata.lastUserMessageId || threadMetadata.lastMessageId || parsed.messageHeaderId
+        : threadMetadata.lastMessageId || parsed.messageHeaderId,
       references: threadMetadata.references || parsed.references,
       workdir: ctx.workdir,
     });
@@ -579,6 +593,40 @@ async function fetchThreadMetadata(
   return { subject, lastMessageId, references };
 }
 
+async function fetchThreadParticipants(
+  gmail: gmail_v1.Gmail,
+  threadId: string,
+  selfEmail: string,
+): Promise<{ replyTo: string; lastUserMessageId: string }> {
+  const thread = await gmail.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "full",
+  });
+
+  let replyTo = "";
+  let lastUserMessageId = "";
+
+  for (const message of thread.data.messages ?? []) {
+    const headers = message.payload?.headers ?? [];
+    const from = extractEmailAddress(getHeader(headers, "From") || "");
+    const messageId = normalizeMessageId(getHeader(headers, "Message-Id")) || "";
+    if (!from || from.toLowerCase() === selfEmail.toLowerCase() || isMailerDaemonSender(from)) {
+      continue;
+    }
+    replyTo = from;
+    if (messageId) {
+      lastUserMessageId = messageId;
+    }
+  }
+
+  if (!replyTo) {
+    replyTo = DEFAULT_ALLOWED_SENDERS[0];
+  }
+
+  return { replyTo, lastUserMessageId };
+}
+
 function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | undefined): string {
   if (!payload) {
     return "";
@@ -692,6 +740,21 @@ function buildEmailPrompt(body: string, existing: boolean): string {
   return `${instructions}\n\n${body}`;
 }
 
+function buildBounceRecoveryPrompt(body: string): string {
+  return [
+    "The previous email reply bounced from Gmail.",
+    "Read the bounce details below and resend a corrected reply to the human user in the same thread.",
+    "Always respond in markdown.",
+    "Do not mention raw MIME mechanics unless asked.",
+    "If attachments were blocked, resend them in a Gmail-safe way.",
+    "For code or script files with blocked extensions such as .js, attach a safe text version instead of the original blocked extension.",
+    "For images, prefer inline raster images or Gmail-safe attachments.",
+    "",
+    "Bounce details:",
+    body,
+  ].join("\n");
+}
+
 async function sendReply(
   gmail: gmail_v1.Gmail,
   args: {
@@ -722,6 +785,7 @@ async function sendMessage(
   },
 ): Promise<gmail_v1.Schema$Message> {
   const rendered = await renderEmailBody(args.body, args.workdir);
+  const safeAttachments = rendered.attachments.map(sanitizeAttachmentForGmail);
   const lines = [
     `From: ${args.from}`,
     `To: ${args.to}`,
@@ -765,7 +829,7 @@ async function sendMessage(
       lines.push(...encodeMimeBase64(image.content), "");
     }
 
-    for (const attachment of rendered.attachments) {
+    for (const attachment of safeAttachments) {
       lines.push(`--${relatedBoundary}`);
       lines.push(`Content-Type: ${attachment.contentType}; name="${attachment.filename}"`);
       lines.push("Content-Transfer-Encoding: base64");
@@ -957,6 +1021,20 @@ function guessAttachmentContentType(filePath: string): string {
   }
 }
 
+function sanitizeAttachmentForGmail(attachment: Attachment): Attachment {
+  const ext = path.extname(attachment.filename).toLowerCase();
+  if (!GMAIL_BLOCKED_EXTENSIONS.has(ext)) {
+    return attachment;
+  }
+
+  return {
+    ...attachment,
+    originalFilename: attachment.filename,
+    filename: `${attachment.filename}.txt`,
+    contentType: "text/plain; charset=utf-8",
+  };
+}
+
 function renderMarkdownToText(markdown: string, inlineImages: InlineImage[], attachments: Attachment[]): string {
   let text = markdown;
   for (const image of inlineImages) {
@@ -1131,7 +1209,14 @@ function isAllowedSender(ctx: Context, sender: string, options: ProcessOptions =
   if (options.includeSelf && normalized === ctx.emailAddress.toLowerCase()) {
     return true;
   }
+  if (normalized === MAILER_DAEMON_ADDRESS) {
+    return true;
+  }
   return ctx.allowedSenders.has(normalized);
+}
+
+function isMailerDaemonSender(sender: string): boolean {
+  return sender.trim().toLowerCase() === MAILER_DAEMON_ADDRESS;
 }
 
 async function waitForMessage(gmail: gmail_v1.Gmail, threadId: string, timeoutMs = 15_000): Promise<void> {
